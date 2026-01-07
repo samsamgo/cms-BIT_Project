@@ -2,23 +2,17 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"time"
 )
 
-// =========================
-// Directus 응답 공통 구조
-// =========================
-
 type DirectusList[T any] struct {
 	Data []T `json:"data"`
 }
-
-// =========================
-// Data Models
-// =========================
 
 type Display struct {
 	ID        int    `json:"id"`
@@ -28,21 +22,14 @@ type Display struct {
 	Height    int    `json:"height"`
 }
 
-// =========================
-// main
-// =========================
-
 func main() {
 	mux := http.NewServeMux()
 
-	// ---- Health Check ----
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 
-	// ---- GET /v1/display ----
-	// Directus에서 displays 컬렉션 읽어서 그대로 반환
 	mux.HandleFunc("/v1/display", func(w http.ResponseWriter, r *http.Request) {
 		directusURL := os.Getenv("DIRECTUS_URL")
 		if directusURL == "" {
@@ -56,7 +43,7 @@ func main() {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(displays)
+		_ = json.NewEncoder(w).Encode(displays)
 	})
 
 	addr := ":8080"
@@ -70,25 +57,33 @@ func main() {
 	log.Fatal(srv.ListenAndServe())
 }
 
-// =========================
-// Directus Client
-// =========================
-
 func fetchDisplays(directusURL string) ([]Display, error) {
 	url := directusURL + "/items/displays"
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(url)
+	client := &http.Client{Timeout: 8 * time.Second}
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Bearer Token (절대 하드코딩하지 말고 환경변수로 받습니다)
+	token := os.Getenv("DIRECTUS_TOKEN")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		return nil, &httpError{
-			status: resp.StatusCode,
-			msg:    "directus returned " + resp.Status,
-		}
+	log.Println("Directus GET:", url, "status:", resp.Status)
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("directus returned %s: %s", resp.Status, string(body))
 	}
 
 	var result DirectusList[Display]
@@ -97,17 +92,4 @@ func fetchDisplays(directusURL string) ([]Display, error) {
 	}
 
 	return result.Data, nil
-}
-
-// =========================
-// Error Helper
-// =========================
-
-type httpError struct {
-	status int
-	msg    string
-}
-
-func (e *httpError) Error() string {
-	return e.msg
 }
