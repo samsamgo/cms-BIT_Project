@@ -84,13 +84,13 @@ func main() {
 	log.Println("go-api listening on", addr)
 	log.Fatal(srv.ListenAndServe())
 }
-func fetchSettings(directusURL string) ([]Setting, error) {
+func fetchSettings(directusURL string) (Setting, error) {
 	url := directusURL + "/items/settings"
 	client := &http.Client{Timeout: 8 * time.Second}
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return nil, err
+		return Setting{}, err
 	}
 
 	token := os.Getenv("DIRECTUS_TOKEN")
@@ -99,7 +99,7 @@ func fetchSettings(directusURL string) ([]Setting, error) {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return Setting{}, err
 	}
 	defer resp.Body.Close()
 
@@ -107,18 +107,17 @@ func fetchSettings(directusURL string) ([]Setting, error) {
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("directus returned %s: %s", resp.Status, string(body))
+		return Setting{}, fmt.Errorf("directus returned %s: %s", resp.Status, string(body))
 	}
 	var result struct {
-		Data []Setting `json:"data"`
+		Data Setting `json:"data"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
+		return Setting{}, err
 	}
 
 	return result.Data, nil
-
 }
 
 func fetchDisplays(directusURL string) ([]Display, error) {
