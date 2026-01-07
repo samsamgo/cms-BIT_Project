@@ -59,8 +59,19 @@ func main() {
 	})
 
 	mux.HandleFunc("/v1/display/1/config", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+		directusURL := os.Getenv("DIRECTUS_URL")
+		if directusURL == "" {
+			directusURL = "http://localhost:8055"
+		}
+
+		settings, err := fetchSettings(directusURL)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(settings)
 	})
 
 	addr := ":8080"
