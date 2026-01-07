@@ -21,6 +21,18 @@ type Display struct {
 	Width     int    `json:"width"`
 	Height    int    `json:"height"`
 }
+type Setting struct {
+	ID          int    `json:"id"`
+	Theme       string `json:"theme"`
+	Refresh_Sec int    `json:"refresh_sec"`
+	Font        string `json:"font"`
+	Max_Routes  int    `json:"max_routes"`
+}
+
+type Displayconfig struct {
+	Display Display `json:"display_id"`
+	Setting Setting `json:"setting_id"`
+}
 
 func main() {
 	mux := http.NewServeMux()
@@ -86,7 +98,10 @@ func fetchDisplays(directusURL string) ([]Display, error) {
 		return nil, fmt.Errorf("directus returned %s: %s", resp.Status, string(body))
 	}
 
-	var result DirectusList[Display]
+	var result struct {
+		Data []Display `json:"data"`
+	}
+	//var result DirectusList[Display]
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
