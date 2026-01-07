@@ -30,8 +30,8 @@ type Setting struct {
 }
 
 type Displayconfig struct {
-	Display Display `json:"display_id"`
-	Setting Setting `json:"setting_id"`
+	Display Display `json:"display"`
+	Setting Setting `json:"settings"`
 }
 
 func main() {
@@ -64,14 +64,43 @@ func main() {
 			directusURL = "http://localhost:8055"
 		}
 
+		// 1) settings 가져오기 (이미 성공했던 부분)
 		settings, err := fetchSettings(directusURL)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
 
+		// 2) displays 가져오기
+		displays, err := fetchDisplays(directusURL)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+
+		// 3) display_id == 1인 display 하나 고르기
+		var d Display
+		found := false
+		for _, x := range displays {
+			if x.DisplayID == 1 {
+				d = x
+				found = true
+				break
+			}
+		}
+		if !found {
+			http.Error(w, "display_id=1 not found", http.StatusNotFound)
+			return
+		}
+
+		// 4) 조립해서 응답
+		cfg := Displayconfig{
+			Display: d,
+			Setting: settings,
+		}
+
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(settings)
+		_ = json.NewEncoder(w).Encode(cfg)
 	})
 
 	addr := ":8080"
