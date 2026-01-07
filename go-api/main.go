@@ -58,6 +58,11 @@ func main() {
 		_ = json.NewEncoder(w).Encode(displays)
 	})
 
+	mux.HandleFunc("/v1/display/1/config", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
 	addr := ":8080"
 	srv := &http.Server{
 		Addr:              addr,
