@@ -28,10 +28,29 @@ type Setting struct {
 	Font        string `json:"font"`
 	Max_Routes  int    `json:"max_routes"`
 }
+type Route struct {
+	ID        int    `json:"id"`
+	RouteID   int    `json:"route_id"`
+	RouteName string `json:"route_name"`
+	Enabled   bool   `json:"enabled"`
+}
+
+type DisplayRoute struct {
+	ID        int `json:"id"`
+	DisplayID int `json:"display_id"`
+	RouteID   int `json:"route_id"`
+	SortOrder int `json:"sort_order"`
+}
 
 type Displayconfig struct {
 	Display Display `json:"display"`
 	Setting Setting `json:"settings"`
+	Routes  []struct {
+		RouteID   int    `json:"route_id"`
+		RouteName string `json:"route_name"`
+		Enabled   bool   `json:"enabled"`
+		SortOrder int    `json:"sort_order"`
+	} `json:"routes"`
 }
 
 func main() {
@@ -113,6 +132,91 @@ func main() {
 	log.Println("go-api listening on", addr)
 	log.Fatal(srv.ListenAndServe())
 }
+
+func fetchRoutesByIDs(directusURL string, routeIDs []int) ([]Route, error) {
+	if len(routeIDs) == 0 {
+		return []Route{}, nil
+	}
+
+	// 10,12,13 같은 형태로 만들기
+	parts := make([]string, 0, len(routeIDs))
+	for _, id := range routeIDs {
+		parts = append(parts, strconv.Itoa(id))
+	}
+	inList := strings.Join(parts, ",")
+
+	url := fmt.Sprintf("%s/items/routes?filter[route_id][_in]=%s", directusURL, inList)
+
+	client := &http.Client{Timeout: 8 * time.Second}
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	token := os.Getenv("DIRECTUS_TOKEN")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("directus returned %s: %s", resp.Status, string(body))
+	}
+
+	var result struct {
+		Data []Route `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return result.Data, nil
+}
+
+
+func fetchDisplayRoutes(directusURL string, displayID int) ([]DisplayRoute, error) {
+	url := fmt.Sprintf("%s/items/display_routes?filter[display_id][_eq]=%d&sort=sort_order", directusURL, displayID)
+
+	client := &http.Client{Timeout: 8 * time.Second}
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	token := os.Getenv("DIRECTUS_TOKEN")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("directus returned %s: %s", resp.Status, string(body))
+	}
+
+	var result struct {
+		Data []DisplayRoute `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return result.Data, nil
+}
+
 func fetchSettings(directusURL string) (Setting, error) {
 	url := directusURL + "/items/settings"
 	client := &http.Client{Timeout: 8 * time.Second}
