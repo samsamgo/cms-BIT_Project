@@ -7,12 +7,13 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"time"
+	"strconv"
+	"strings"
 )
 
-type DirectusList[T any] struct {
-	Data []T `json:"data"`
-}
+/* =====================
+   Types
+===================== */
 
 type Display struct {
 	ID        int    `json:"id"`
@@ -21,13 +22,15 @@ type Display struct {
 	Width     int    `json:"width"`
 	Height    int    `json:"height"`
 }
+
 type Setting struct {
-	ID          int    `json:"id"`
-	Theme       string `json:"theme"`
-	Refresh_Sec int    `json:"refresh_sec"`
-	Font        string `json:"font"`
-	Max_Routes  int    `json:"max_routes"`
+	ID         int    `json:"id"`
+	Theme      string `json:"theme"`
+	RefreshSec int    `json:"refresh_sec"`
+	Font       string `json:"font"`
+	MaxRoutes  int    `json:"max_routes"`
 }
+
 type Route struct {
 	ID        int    `json:"id"`
 	RouteID   int    `json:"route_id"`
@@ -42,16 +45,20 @@ type DisplayRoute struct {
 	SortOrder int `json:"sort_order"`
 }
 
-type Displayconfig struct {
-	Display Display `json:"display"`
-	Setting Setting `json:"settings"`
-	Routes  []struct {
+type DisplayConfig struct {
+	Display  Display `json:"display"`
+	Settings Setting `json:"settings"`
+	Routes   []struct {
 		RouteID   int    `json:"route_id"`
 		RouteName string `json:"route_name"`
 		Enabled   bool   `json:"enabled"`
 		SortOrder int    `json:"sort_order"`
 	} `json:"routes"`
 }
+
+/* =====================
+   Main
+===================== */
 
 func main() {
 	mux := http.NewServeMux()
@@ -61,48 +68,31 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	mux.HandleFunc("/v1/display", func(w http.ResponseWriter, r *http.Request) {
-		directusURL := os.Getenv("DIRECTUS_URL")
-		if directusURL == "" {
-			directusURL = "http://localhost:8055"
-		}
-
-		displays, err := fetchDisplays(directusURL)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(displays)
-	})
-
 	mux.HandleFunc("/v1/display/1/config", func(w http.ResponseWriter, r *http.Request) {
 		directusURL := os.Getenv("DIRECTUS_URL")
 		if directusURL == "" {
 			directusURL = "http://localhost:8055"
 		}
 
-		// 1) settings 가져오기 (이미 성공했던 부분)
+		// 1. settings
 		settings, err := fetchSettings(directusURL)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
 
-		// 2) displays 가져오기
+		// 2. display
 		displays, err := fetchDisplays(directusURL)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
 
-		// 3) display_id == 1인 display 하나 고르기
-		var d Display
+		var display Display
 		found := false
-		for _, x := range displays {
-			if x.DisplayID == 1 {
-				d = x
+		for _, d := range displays {
+			if d.DisplayID == 1 {
+				display = d
 				found = true
 				break
 			}
@@ -112,183 +102,165 @@ func main() {
 			return
 		}
 
-		// 4) 조립해서 응답
-		cfg := Displayconfig{
-			Display: d,
-			Setting: settings,
+		// 3. display_routes
+		links, err := fetchDisplayRoutes(directusURL, 1)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+
+		routeIDs := make([]int, 0, len(links))
+		sortMap := make(map[int]int)
+		for _, l := range links {
+			routeIDs = append(routeIDs, l.RouteID)
+			sortMap[l.RouteID] = l.SortOrder
+		}
+
+		// 4. routes
+		routes, err := fetchRoutesByIDs(directusURL, routeIDs)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+
+		routeMap := make(map[int]Route)
+		for _, r := range routes {
+			routeMap[r.RouteID] = r
+		}
+
+		cfgRoutes := make([]struct {
+			RouteID   int    `json:"route_id"`
+			RouteName string `json:"route_name"`
+			Enabled   bool   `json:"enabled"`
+			SortOrder int    `json:"sort_order"`
+		}, 0)
+
+		for _, rid := range routeIDs {
+			r, ok := routeMap[rid]
+			if !ok {
+				continue
+			}
+			cfgRoutes = append(cfgRoutes, struct {
+				RouteID   int    `json:"route_id"`
+				RouteName string `json:"route_name"`
+				Enabled   bool   `json:"enabled"`
+				SortOrder int    `json:"sort_order"`
+			}{
+				RouteID:   r.RouteID,
+				RouteName: r.RouteName,
+				Enabled:   r.Enabled,
+				SortOrder: sortMap[rid],
+			})
+		}
+
+		cfg := DisplayConfig{
+			Display:  display,
+			Settings: settings,
+			Routes:   cfgRoutes,
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(cfg)
 	})
 
-	addr := ":8080"
-	srv := &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-
-	log.Println("go-api listening on", addr)
-	log.Fatal(srv.ListenAndServe())
+	log.Println("go-api listening on :8080")
+	log.Fatal(http.ListenAndServe(":8080", mux))
 }
 
-func fetchRoutesByIDs(directusURL string, routeIDs []int) ([]Route, error) {
-	if len(routeIDs) == 0 {
-		return []Route{}, nil
-	}
+/* =====================
+   Fetch functions
+===================== */
 
-	// 10,12,13 같은 형태로 만들기
-	parts := make([]string, 0, len(routeIDs))
-	for _, id := range routeIDs {
-		parts = append(parts, strconv.Itoa(id))
-	}
-	inList := strings.Join(parts, ",")
-
-	url := fmt.Sprintf("%s/items/routes?filter[route_id][_in]=%s", directusURL, inList)
-
-	client := &http.Client{Timeout: 8 * time.Second}
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-
+func authRequest(req *http.Request) {
 	token := os.Getenv("DIRECTUS_TOKEN")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("directus returned %s: %s", resp.Status, string(body))
-	}
-
-	var result struct {
-		Data []Route `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
-
-	return result.Data, nil
-}
-
-
-func fetchDisplayRoutes(directusURL string, displayID int) ([]DisplayRoute, error) {
-	url := fmt.Sprintf("%s/items/display_routes?filter[display_id][_eq]=%d&sort=sort_order", directusURL, displayID)
-
-	client := &http.Client{Timeout: 8 * time.Second}
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	token := os.Getenv("DIRECTUS_TOKEN")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("directus returned %s: %s", resp.Status, string(body))
-	}
-
-	var result struct {
-		Data []DisplayRoute `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
-
-	return result.Data, nil
 }
 
 func fetchSettings(directusURL string) (Setting, error) {
 	url := directusURL + "/items/settings"
-	client := &http.Client{Timeout: 8 * time.Second}
+	req, _ := http.NewRequest("GET", url, nil)
+	authRequest(req)
 
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return Setting{}, err
-	}
-
-	token := os.Getenv("DIRECTUS_TOKEN")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return Setting{}, err
 	}
 	defer resp.Body.Close()
 
-	log.Println("Directus GET:", url, "status:", resp.Status)
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return Setting{}, fmt.Errorf("directus returned %s: %s", resp.Status, string(body))
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return Setting{}, fmt.Errorf("directus error: %s", string(b))
 	}
+
 	var result struct {
 		Data Setting `json:"data"`
 	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return Setting{}, err
-	}
-
-	return result.Data, nil
+	err = json.NewDecoder(resp.Body).Decode(&result)
+	return result.Data, err
 }
 
 func fetchDisplays(directusURL string) ([]Display, error) {
 	url := directusURL + "/items/displays"
+	req, _ := http.NewRequest("GET", url, nil)
+	authRequest(req)
 
-	client := &http.Client{Timeout: 8 * time.Second}
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	// Bearer Token (절대 하드코딩하지 말고 환경변수로 받습니다)
-	token := os.Getenv("DIRECTUS_TOKEN")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	log.Println("Directus GET:", url, "status:", resp.Status)
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("directus returned %s: %s", resp.Status, string(body))
-	}
-
 	var result struct {
 		Data []Display `json:"data"`
 	}
-	//var result DirectusList[Display]
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	err = json.NewDecoder(resp.Body).Decode(&result)
+	return result.Data, err
+}
+
+func fetchDisplayRoutes(directusURL string, displayID int) ([]DisplayRoute, error) {
+	url := fmt.Sprintf("%s/items/display_routes?filter[display_id][_eq]=%d&sort=sort_order", directusURL, displayID)
+	req, _ := http.NewRequest("GET", url, nil)
+	authRequest(req)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
 		return nil, err
 	}
+	defer resp.Body.Close()
 
-	return result.Data, nil
+	var result struct {
+		Data []DisplayRoute `json:"data"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&result)
+	return result.Data, err
+}
+
+func fetchRoutesByIDs(directusURL string, ids []int) ([]Route, error) {
+	if len(ids) == 0 {
+		return []Route{}, nil
+	}
+
+	s := make([]string, 0, len(ids))
+	for _, id := range ids {
+		s = append(s, strconv.Itoa(id))
+	}
+	in := strings.Join(s, ",")
+
+	url := fmt.Sprintf("%s/items/routes?filter[route_id][_in]=%s", directusURL, in)
+	req, _ := http.NewRequest("GET", url, nil)
+	authRequest(req)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Data []Route `json:"data"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&result)
+	return result.Data, err
 }
