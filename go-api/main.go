@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 /* =====================
@@ -54,6 +55,15 @@ type DisplayConfig struct {
 		Enabled   bool   `json:"enabled"`
 		SortOrder int    `json:"sort_order"`
 	} `json:"routes"`
+}
+
+/* =====================
+   HTTP Client (timeout <= 5s)
+===================== */
+
+// 전역으로 둬야 doGet/fetch*에서 쓸 수 있음
+var httpClient = &http.Client{
+	Timeout: 5 * time.Second,
 }
 
 /* =====================
@@ -124,8 +134,8 @@ func main() {
 		}
 
 		routeMap := make(map[int]Route)
-		for _, r := range routes {
-			routeMap[r.RouteID] = r
+		for _, rr := range routes {
+			routeMap[rr.RouteID] = rr
 		}
 
 		cfgRoutes := make([]struct {
@@ -136,7 +146,7 @@ func main() {
 		}, 0)
 
 		for _, rid := range routeIDs {
-			r, ok := routeMap[rid]
+			rr, ok := routeMap[rid]
 			if !ok {
 				continue
 			}
@@ -146,9 +156,9 @@ func main() {
 				Enabled   bool   `json:"enabled"`
 				SortOrder int    `json:"sort_order"`
 			}{
-				RouteID:   r.RouteID,
-				RouteName: r.RouteName,
-				Enabled:   r.Enabled,
+				RouteID:   rr.RouteID,
+				RouteName: rr.RouteName,
+				Enabled:   rr.Enabled,
 				SortOrder: sortMap[rid],
 			})
 		}
@@ -178,63 +188,79 @@ func authRequest(req *http.Request) {
 	}
 }
 
-func fetchSettings(directusURL string) (Setting, error) {
-	url := directusURL + "/items/settings"
+// 공통 외부 API GET (raw bytes 반환)
+func doGet(directusURL, pathWithQuery string) ([]byte, error) {
+	url := directusURL + pathWithQuery
+
 	req, _ := http.NewRequest("GET", url, nil)
 	authRequest(req)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
-		return Setting{}, err
+		return nil, fmt.Errorf("directus request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read body failed: %w", err)
+	}
+
 	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return Setting{}, fmt.Errorf("directus error: %s", string(b))
+		msg := string(b)
+		if len(msg) > 300 {
+			msg = msg[:300] + "..."
+		}
+		return nil, fmt.Errorf("directus error status=%d body=%s", resp.StatusCode, msg)
+	}
+
+	return b, nil
+}
+
+func fetchSettings(directusURL string) (Setting, error) {
+	raw, err := doGet(directusURL, "/items/settings")
+	if err != nil {
+		return Setting{}, err
 	}
 
 	var result struct {
 		Data Setting `json:"data"`
 	}
-	err = json.NewDecoder(resp.Body).Decode(&result)
-	return result.Data, err
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return Setting{}, fmt.Errorf("decode settings failed: %w", err)
+	}
+	return result.Data, nil
 }
 
 func fetchDisplays(directusURL string) ([]Display, error) {
-	url := directusURL + "/items/displays"
-	req, _ := http.NewRequest("GET", url, nil)
-	authRequest(req)
-
-	resp, err := http.DefaultClient.Do(req)
+	raw, err := doGet(directusURL, "/items/displays")
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
 	var result struct {
 		Data []Display `json:"data"`
 	}
-	err = json.NewDecoder(resp.Body).Decode(&result)
-	return result.Data, err
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("decode displays failed: %w", err)
+	}
+	return result.Data, nil
 }
 
 func fetchDisplayRoutes(directusURL string, displayID int) ([]DisplayRoute, error) {
-	url := fmt.Sprintf("%s/items/display_routes?filter[display_id][_eq]=%d&sort=sort_order", directusURL, displayID)
-	req, _ := http.NewRequest("GET", url, nil)
-	authRequest(req)
-
-	resp, err := http.DefaultClient.Do(req)
+	path := fmt.Sprintf("/items/display_routes?filter[display_id][_eq]=%d&sort=sort_order", displayID)
+	raw, err := doGet(directusURL, path)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
 	var result struct {
 		Data []DisplayRoute `json:"data"`
 	}
-	err = json.NewDecoder(resp.Body).Decode(&result)
-	return result.Data, err
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("decode display_routes failed: %w", err)
+	}
+	return result.Data, nil
 }
 
 func fetchRoutesByIDs(directusURL string, ids []int) ([]Route, error) {
@@ -248,19 +274,17 @@ func fetchRoutesByIDs(directusURL string, ids []int) ([]Route, error) {
 	}
 	in := strings.Join(s, ",")
 
-	url := fmt.Sprintf("%s/items/routes?filter[route_id][_in]=%s", directusURL, in)
-	req, _ := http.NewRequest("GET", url, nil)
-	authRequest(req)
-
-	resp, err := http.DefaultClient.Do(req)
+	path := fmt.Sprintf("/items/routes?filter[route_id][_in]=%s", in)
+	raw, err := doGet(directusURL, path)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
 	var result struct {
 		Data []Route `json:"data"`
 	}
-	err = json.NewDecoder(resp.Body).Decode(&result)
-	return result.Data, err
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("decode routes failed: %w", err)
+	}
+	return result.Data, nil
 }
