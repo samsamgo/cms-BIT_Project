@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -58,12 +59,28 @@ type DisplayConfig struct {
 }
 
 /* =====================
-   HTTP Client (timeout <= 5s)
+   Cache (last_good_raw)
 ===================== */
 
-// 전역으로 둬야 doGet/fetch*에서 쓸 수 있음
-var httpClient = &http.Client{
-	Timeout: 5 * time.Second,
+var (
+	cacheMu     sync.RWMutex
+	lastGoodRaw []byte
+)
+
+func writeCachedOrError(w http.ResponseWriter, err error) {
+	cacheMu.RLock()
+	cached := append([]byte(nil), lastGoodRaw...)
+	cacheMu.RUnlock()
+
+	if len(cached) > 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(cached)
+		return
+	}
+
+	// 캐시가 없을 때만 503 허용 (빈 JSON 금지)
+	http.Error(w, err.Error(), http.StatusServiceUnavailable)
 }
 
 /* =====================
@@ -78,6 +95,7 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
+	// display+settings+routes (Directus 실패 시 lastGoodRaw 반환)
 	mux.HandleFunc("/v1/display/1/config", func(w http.ResponseWriter, r *http.Request) {
 		directusURL := os.Getenv("DIRECTUS_URL")
 		if directusURL == "" {
@@ -87,14 +105,14 @@ func main() {
 		// 1. settings
 		settings, err := fetchSettings(directusURL)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			writeCachedOrError(w, err)
 			return
 		}
 
 		// 2. display
 		displays, err := fetchDisplays(directusURL)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			writeCachedOrError(w, err)
 			return
 		}
 
@@ -108,14 +126,16 @@ func main() {
 			}
 		}
 		if !found {
-			http.Error(w, "display_id=1 not found", http.StatusNotFound)
+			// 이 케이스는 외부 API 장애라기보다 데이터 문제라서 캐시로 처리해도 되지만,
+			// 정책상 "빈 값 금지"가 중요하면 캐시를 우선 반환하고, 캐시 없으면 503 처리합니다.
+			writeCachedOrError(w, fmt.Errorf("display_id=1 not found"))
 			return
 		}
 
 		// 3. display_routes
 		links, err := fetchDisplayRoutes(directusURL, 1)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			writeCachedOrError(w, err)
 			return
 		}
 
@@ -129,7 +149,7 @@ func main() {
 		// 4. routes
 		routes, err := fetchRoutesByIDs(directusURL, routeIDs)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			writeCachedOrError(w, err)
 			return
 		}
 
@@ -169,8 +189,20 @@ func main() {
 			Routes:   cfgRoutes,
 		}
 
+		// ✅ 정상일 때만 raw를 만들어 캐시에 저장
+		raw, err := json.Marshal(cfg)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		cacheMu.Lock()
+		lastGoodRaw = raw
+		cacheMu.Unlock()
+
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(cfg)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(raw)
 	})
 
 	log.Println("go-api listening on :8080")
@@ -188,79 +220,78 @@ func authRequest(req *http.Request) {
 	}
 }
 
-// 공통 외부 API GET (raw bytes 반환)
-func doGet(directusURL, pathWithQuery string) ([]byte, error) {
-	url := directusURL + pathWithQuery
-
+func fetchSettings(directusURL string) (Setting, error) {
+	url := directusURL + "/items/settings"
 	req, _ := http.NewRequest("GET", url, nil)
 	authRequest(req)
 
-	resp, err := httpClient.Do(req)
+	// NOTE: timeout≤5초 적용(기본 client로는 무한대 가능)
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("directus request failed: %w", err)
+		return Setting{}, fmt.Errorf("directus request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read body failed: %w", err)
-	}
-
 	if resp.StatusCode >= 300 {
-		msg := string(b)
-		if len(msg) > 300 {
-			msg = msg[:300] + "..."
-		}
-		return nil, fmt.Errorf("directus error status=%d body=%s", resp.StatusCode, msg)
-	}
-
-	return b, nil
-}
-
-func fetchSettings(directusURL string) (Setting, error) {
-	raw, err := doGet(directusURL, "/items/settings")
-	if err != nil {
-		return Setting{}, err
+		b, _ := io.ReadAll(resp.Body)
+		return Setting{}, fmt.Errorf("directus error: %s", string(b))
 	}
 
 	var result struct {
 		Data Setting `json:"data"`
 	}
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return Setting{}, fmt.Errorf("decode settings failed: %w", err)
-	}
-	return result.Data, nil
+	err = json.NewDecoder(resp.Body).Decode(&result)
+	return result.Data, err
 }
 
 func fetchDisplays(directusURL string) ([]Display, error) {
-	raw, err := doGet(directusURL, "/items/displays")
+	url := directusURL + "/items/displays"
+	req, _ := http.NewRequest("GET", url, nil)
+	authRequest(req)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("directus request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("directus error: %s", string(b))
 	}
 
 	var result struct {
 		Data []Display `json:"data"`
 	}
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return nil, fmt.Errorf("decode displays failed: %w", err)
-	}
-	return result.Data, nil
+	err = json.NewDecoder(resp.Body).Decode(&result)
+	return result.Data, err
 }
 
 func fetchDisplayRoutes(directusURL string, displayID int) ([]DisplayRoute, error) {
-	path := fmt.Sprintf("/items/display_routes?filter[display_id][_eq]=%d&sort=sort_order", displayID)
-	raw, err := doGet(directusURL, path)
+	url := fmt.Sprintf("%s/items/display_routes?filter[display_id][_eq]=%d&sort=sort_order", directusURL, displayID)
+	req, _ := http.NewRequest("GET", url, nil)
+	authRequest(req)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("directus request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("directus error: %s", string(b))
 	}
 
 	var result struct {
 		Data []DisplayRoute `json:"data"`
 	}
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return nil, fmt.Errorf("decode display_routes failed: %w", err)
-	}
-	return result.Data, nil
+	err = json.NewDecoder(resp.Body).Decode(&result)
+	return result.Data, err
 }
 
 func fetchRoutesByIDs(directusURL string, ids []int) ([]Route, error) {
@@ -274,17 +305,25 @@ func fetchRoutesByIDs(directusURL string, ids []int) ([]Route, error) {
 	}
 	in := strings.Join(s, ",")
 
-	path := fmt.Sprintf("/items/routes?filter[route_id][_in]=%s", in)
-	raw, err := doGet(directusURL, path)
+	url := fmt.Sprintf("%s/items/routes?filter[route_id][_in]=%s", directusURL, in)
+	req, _ := http.NewRequest("GET", url, nil)
+	authRequest(req)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("directus request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("directus error: %s", string(b))
 	}
 
 	var result struct {
 		Data []Route `json:"data"`
 	}
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return nil, fmt.Errorf("decode routes failed: %w", err)
-	}
-	return result.Data, nil
+	err = json.NewDecoder(resp.Body).Decode(&result)
+	return result.Data, err
 }
