@@ -65,12 +65,17 @@ type DisplayConfig struct {
 var (
 	cacheMu     sync.RWMutex
 	lastGoodRaw []byte
+	lastGoodAt  time.Time
+	lastErr     string
 )
 
 func writeCachedOrError(w http.ResponseWriter, err error) {
 	cacheMu.RLock()
 	cached := append([]byte(nil), lastGoodRaw...)
 	cacheMu.RUnlock()
+	cacheMu.Lock()
+	lastErr = err.Error()
+	cacheMu.Unlock()
 
 	if len(cached) > 0 {
 		w.Header().Set("Content-Type", "application/json")
@@ -91,8 +96,19 @@ func main() {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+		cacheMu.RLock()
+		ok := len(lastGoodRaw) > 0
+		at := lastGoodAt
+		le := lastErr
+		cacheMu.RUnlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":      "ok",
+			"cache_ready": ok,
+			"cache_at":    at.Format(time.RFC3339),
+			"last_error":  le,
+		})
 	})
 
 	// display+settings+routes (Directus 실패 시 lastGoodRaw 반환)
@@ -198,6 +214,8 @@ func main() {
 
 		cacheMu.Lock()
 		lastGoodRaw = raw
+		lastGoodAt = time.Now()
+		lastErr = ""
 		cacheMu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
