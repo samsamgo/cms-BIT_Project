@@ -57,6 +57,11 @@ type DisplayConfig struct {
 		SortOrder int    `json:"sort_order"`
 	} `json:"routes"`
 }
+type FailLog struct {
+	At     time.Time `json:"at"`
+	Where  string    `json:"where"`
+	Reason string    `json:"reason"`
+}
 
 /* =====================
    Cache (last_good_raw)
@@ -67,6 +72,9 @@ var (
 	lastGoodRaw []byte
 	lastGoodAt  time.Time
 	lastErr     string
+	// ✅ 실패 로그: 최근 50개만 유지
+	failLogs    []FailLog
+	failLogsMax = 50
 )
 
 func writeCachedOrError(w http.ResponseWriter, err error) {
@@ -100,14 +108,23 @@ func main() {
 		ok := len(lastGoodRaw) > 0
 		at := lastGoodAt
 		le := lastErr
+
+		// 최근 5개만 노출
+		n := 5
+		if len(failLogs) < n {
+			n = len(failLogs)
+		}
+		recent := make([]FailLog, n)
+		copy(recent, failLogs[len(failLogs)-n:])
 		cacheMu.RUnlock()
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status":      "ok",
-			"cache_ready": ok,
-			"cache_at":    at.Format(time.RFC3339),
-			"last_error":  le,
+			"status":       "ok",
+			"cache_ready":  ok,
+			"cache_at":     at.Format(time.RFC3339),
+			"last_error":   le,
+			"recent_fails": recent,
 		})
 	})
 
@@ -160,9 +177,31 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", mux))
 }
 
-/* =====================
-   Fetch functions
-===================== */
+/*
+	=====================
+	  Fetch functions
+
+=====================
+*/
+func addFailLog(where string, err error) {
+	if err == nil {
+		return
+	}
+	fl := FailLog{
+		At:     time.Now(),
+		Where:  where,
+		Reason: err.Error(),
+	}
+
+	cacheMu.Lock()
+	lastErr = fl.Reason
+
+	failLogs = append(failLogs, fl)
+	if len(failLogs) > failLogsMax {
+		failLogs = failLogs[len(failLogs)-failLogsMax:]
+	}
+	cacheMu.Unlock()
+}
 
 func validateConfig(cfg DisplayConfig) error {
 	// display 검증
