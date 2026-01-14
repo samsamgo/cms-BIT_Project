@@ -164,6 +164,47 @@ func main() {
    Fetch functions
 ===================== */
 
+func validateConfig(cfg DisplayConfig) error {
+	// display 검증
+	if cfg.Display.DisplayID != 1 {
+		return fmt.Errorf("invalid display_id: %d", cfg.Display.DisplayID)
+	}
+	if cfg.Display.Width <= 0 || cfg.Display.Height <= 0 {
+		return fmt.Errorf("invalid display size: %dx%d", cfg.Display.Width, cfg.Display.Height)
+	}
+
+	// settings 검증
+	if cfg.Settings.Theme == "" {
+		return fmt.Errorf("settings.theme is empty")
+	}
+	if cfg.Settings.RefreshSec <= 0 {
+		return fmt.Errorf("settings.refresh_sec must be > 0")
+	}
+	if cfg.Settings.Font == "" {
+		return fmt.Errorf("settings.font is empty")
+	}
+	if cfg.Settings.MaxRoutes <= 0 {
+		return fmt.Errorf("settings.max_routes must be > 0")
+	}
+
+	// routes 검증 (정책: 비어있으면 실패)
+	if len(cfg.Routes) == 0 {
+		return fmt.Errorf("routes is empty")
+	}
+	for i, r := range cfg.Routes {
+		if r.RouteID <= 0 {
+			return fmt.Errorf("routes[%d].route_id must be > 0", i)
+		}
+		if r.RouteName == "" {
+			return fmt.Errorf("routes[%d].route_name is empty", i)
+		}
+		if r.SortOrder <= 0 {
+			return fmt.Errorf("routes[%d].sort_order must be > 0", i)
+		}
+	}
+	return nil
+}
+
 func getDirectusURL() string {
 	//Directus URL을 얻는 함수 추가
 	directusURL := os.Getenv("DIRECTUS_URL")
@@ -273,6 +314,11 @@ func buildConfig(directusURL string) (DisplayConfig, []byte, error) {
 		Display:  display,
 		Settings: settings,
 		Routes:   cfgRoutes,
+	}
+
+	// ✅ 스키마 검증: 실패면 캐시 갱신 금지
+	if err := validateConfig(cfg); err != nil {
+		return DisplayConfig{}, nil, err
 	}
 
 	raw, err := json.Marshal(cfg)
