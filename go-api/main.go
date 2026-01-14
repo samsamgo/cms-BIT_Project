@@ -112,36 +112,49 @@ func main() {
 	})
 
 	mux.HandleFunc("/v1/display/1/config", func(w http.ResponseWriter, r *http.Request) {
-		// ✅ directusURL을 여기서 잡아야 함
-		directusURL := os.Getenv("DIRECTUS_URL")
-		if directusURL == "" {
-			directusURL = "http://localhost:8055"
-		}
+		cacheMu.RLock()
+		cached := append([]byte(nil), lastGoodRaw...)
+		cacheMu.RUnlock()
 
-		cfg, raw, err := buildConfig(directusURL)
-		_ = cfg // (지금은 raw만 쓰지만, cfg가 필요해질 수도 있으니 유지)
-
-		if err != nil {
-			// ✅ 실패 기록
-			cacheMu.Lock()
-			lastErr = err.Error()
-			cacheMu.Unlock()
-
-			writeCachedOrError(w, err)
+		if len(cached) > 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(cached)
 			return
 		}
 
-		// ✅ 성공이면 캐시 갱신 + lastErr 초기화
-		cacheMu.Lock()
-		lastGoodRaw = raw
-		lastGoodAt = time.Now()
-		lastErr = ""
-		cacheMu.Unlock()
+		// 캐시가 아직 없으면 1회 강제 갱신 시도
+		if err := refreshCacheOnce(); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+
+		cacheMu.RLock()
+		cached = append([]byte(nil), lastGoodRaw...)
+		cacheMu.RUnlock()
+
+		if len(cached) == 0 {
+			http.Error(w, "cache not ready", http.StatusServiceUnavailable)
+			return
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(raw)
+		_, _ = w.Write(cached)
 	})
+
+	// ✅ 시작할 때 1번 즉시 갱신 시도(캐시 채우기)
+	_ = refreshCacheOnce()
+
+	// ✅ 30초마다 갱신
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			_ = refreshCacheOnce()
+		}
+	}()
 
 	log.Println("go-api listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", mux))
@@ -150,6 +163,36 @@ func main() {
 /* =====================
    Fetch functions
 ===================== */
+
+func getDirectusURL() string {
+	//Directus URL을 얻는 함수 추가
+	directusURL := os.Getenv("DIRECTUS_URL")
+	if directusURL == "" {
+		directusURL = "http://localhost:8055"
+	}
+	return directusURL
+}
+
+func refreshCacheOnce() error {
+	//ticker가 이 함수를 주기적으로 부릅니다.
+	directusURL := getDirectusURL()
+
+	_, raw, err := buildConfig(directusURL)
+	if err != nil {
+		cacheMu.Lock()
+		lastErr = err.Error()
+		cacheMu.Unlock()
+		return err
+	}
+
+	cacheMu.Lock()
+	lastGoodRaw = raw
+	lastGoodAt = time.Now()
+	lastErr = ""
+	cacheMu.Unlock()
+
+	return nil
+}
 
 func buildConfig(directusURL string) (DisplayConfig, []byte, error) {
 	// 1) settings
