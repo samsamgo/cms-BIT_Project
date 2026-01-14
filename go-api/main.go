@@ -91,7 +91,8 @@ func writeCachedOrError(w http.ResponseWriter, err error) {
 		_, _ = w.Write(cached)
 		return
 	}
-
+	// ✅ 캐시도 없는데 실패면, 이건 꽤 치명적 상태라 로그 남김
+	addFailLog("writeCachedOrError/no_cache", err)
 	// 캐시가 없을 때만 503 허용 (빈 JSON 금지)
 	http.Error(w, err.Error(), http.StatusServiceUnavailable)
 }
@@ -183,6 +184,46 @@ func main() {
 
 =====================
 */
+
+func isDummyMode() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("DUMMY_MODE")))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+func buildDummyConfig() (DisplayConfig, []byte, error) {
+	cfg := DisplayConfig{
+		Display: Display{
+			ID:        0,
+			DisplayID: 1,
+			Name:      "DUMMY Display",
+			Width:     320,
+			Height:    160,
+		},
+		Settings: Setting{
+			ID:         0,
+			Theme:      "dummy",
+			RefreshSec: 30,
+			Font:       "NOTO Sans KR",
+			MaxRoutes:  5,
+		},
+		Routes: []struct {
+			RouteID   int    `json:"route_id"`
+			RouteName string `json:"route_name"`
+			Enabled   bool   `json:"enabled"`
+			SortOrder int    `json:"sort_order"`
+		}{
+			{RouteID: 1, RouteName: "DUMMY-A", Enabled: true, SortOrder: 1},
+			{RouteID: 2, RouteName: "DUMMY-B", Enabled: true, SortOrder: 2},
+		},
+	}
+
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return DisplayConfig{}, nil, err
+	}
+	return cfg, raw, nil
+}
+
 func addFailLog(where string, err error) {
 	if err == nil {
 		return
@@ -254,6 +295,21 @@ func getDirectusURL() string {
 }
 
 func refreshCacheOnce() error {
+	// ✅ 더미 모드면 Directus를 아예 안 침
+	if isDummyMode() {
+		_, raw, err := buildDummyConfig()
+		if err != nil {
+			addFailLog("dummy_build", err)
+			return err
+		}
+
+		cacheMu.Lock()
+		lastGoodRaw = raw
+		lastGoodAt = time.Now()
+		lastErr = ""
+		cacheMu.Unlock()
+		return nil
+	}
 	//ticker가 이 함수를 주기적으로 부릅니다.
 	directusURL := getDirectusURL()
 
