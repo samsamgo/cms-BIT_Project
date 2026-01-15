@@ -63,6 +63,24 @@ type FailLog struct {
 	Reason string    `json:"reason"`
 }
 
+type StateRoute struct {
+	Route      string `json:"route"`
+	DisplayETA string `json:"display_eta"`
+	Status     string `json:"status"` // "OK" | "NO_DATA" | "ENDED"
+}
+
+type StateResponse struct {
+	Theme      string       `json:"theme"`
+	RefreshSec int          `json:"refresh_sec"`
+	Notice     string       `json:"notice"`
+	Routes     []StateRoute `json:"routes"`
+}
+
+type ETASnapshot struct {
+	ETASec *int
+	Ended  bool
+}
+
 /* =====================
    Cache (last_good_raw)
 ===================== */
@@ -161,6 +179,25 @@ func main() {
 		_, _ = w.Write(cached)
 	})
 
+	mux.HandleFunc("/v1/display/1/state", func(w http.ResponseWriter, r *http.Request) {
+		cacheMu.RLock()
+		hasCache := len(lastGoodRaw) > 0
+		cacheMu.RUnlock()
+
+		if !hasCache {
+			_ = refreshCacheOnce()
+		}
+
+		_, rawState, err := buildStateFromCachedConfig(1)
+		if err != nil {
+			addFailLog("state_build", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(rawState)
+	})
+
 	// ✅ 시작할 때 1번 즉시 갱신 시도(캐시 채우기)
 	_ = refreshCacheOnce()
 
@@ -184,6 +221,136 @@ func main() {
 
 =====================
 */
+func formatETA(etaSec *int, ended bool) (display string, status string) {
+	if ended {
+		return "운행 종료", "ENDED"
+	}
+	if etaSec == nil {
+		return "정보 없음", "NO_DATA"
+	}
+	if *etaSec <= 60 {
+		return "도착중", "OK"
+	}
+	min := (*etaSec + 59) / 60 // 올림
+	return fmt.Sprintf("%d분", min), "OK"
+}
+
+func clampText(s string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
+	rs := []rune(s)
+	if len(rs) <= maxLen {
+		return s
+	}
+	if maxLen == 1 {
+		return string(rs[:1])
+	}
+	return string(rs[:maxLen-1]) + "…"
+}
+
+func limitRoutes(in []StateRoute, max int) []StateRoute {
+	if max <= 0 {
+		return []StateRoute{}
+	}
+	if len(in) <= max {
+		return in
+	}
+	return in[:max]
+}
+
+func getDummyETA(routeID int) ETASnapshot {
+	if routeID%7 == 0 {
+		return ETASnapshot{ETASec: nil, Ended: true}
+	}
+	if routeID%5 == 0 {
+		return ETASnapshot{ETASec: nil, Ended: false}
+	}
+	sec := 20 + (routeID%9)*30
+	return ETASnapshot{ETASec: &sec, Ended: false}
+}
+
+func mustMarshalState(st StateResponse) []byte {
+	b, err := json.Marshal(st)
+	if err != nil {
+		return []byte(`{"theme":"default","refresh_sec":30,"notice":"marshal_failed","routes":[]}`)
+	}
+	return b
+}
+
+func buildStateFromCachedConfig(displayID int) (StateResponse, []byte, error) {
+	cacheMu.RLock()
+	rawCfg := append([]byte(nil), lastGoodRaw...)
+	cacheMu.RUnlock()
+
+	if len(rawCfg) == 0 {
+		st := StateResponse{
+			Theme:      "default",
+			RefreshSec: 30,
+			Notice:     "cache not ready",
+			Routes:     []StateRoute{},
+		}
+		return st, mustMarshalState(st), fmt.Errorf("cache not ready")
+	}
+
+	var cfg DisplayConfig
+	if err := json.Unmarshal(rawCfg, &cfg); err != nil {
+		st := StateResponse{
+			Theme:      "default",
+			RefreshSec: 30,
+			Notice:     "invalid cached config",
+			Routes:     []StateRoute{},
+		}
+		return st, mustMarshalState(st), err
+	}
+
+	if cfg.Display.DisplayID != displayID {
+		st := StateResponse{
+			Theme:      cfg.Settings.Theme,
+			RefreshSec: cfg.Settings.RefreshSec,
+			Notice:     "display_id mismatch",
+			Routes:     []StateRoute{},
+		}
+		return st, mustMarshalState(st), fmt.Errorf("display_id mismatch")
+	}
+
+	out := make([]StateRoute, 0, len(cfg.Routes))
+	for _, r := range cfg.Routes {
+		if !r.Enabled {
+			continue
+		}
+		eta := getDummyETA(r.RouteID)
+		displayETA, status := formatETA(eta.ETASec, eta.Ended)
+
+		out = append(out, StateRoute{
+			Route:      clampText(r.RouteName, 12),
+			DisplayETA: displayETA,
+			Status:     status,
+		})
+	}
+
+	out = limitRoutes(out, cfg.Settings.MaxRoutes)
+
+	state := StateResponse{
+		Theme:      cfg.Settings.Theme,
+		RefreshSec: cfg.Settings.RefreshSec,
+		Notice:     "",
+		Routes:     out,
+	}
+
+	rawState, err := json.Marshal(state)
+	if err != nil {
+		st := StateResponse{
+			Theme:      "default",
+			RefreshSec: 30,
+			Notice:     "state marshal failed",
+			Routes:     []StateRoute{},
+		}
+		return st, mustMarshalState(st), err
+	}
+
+	return state, rawState, nil
+}
 
 func isDummyMode() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("DUMMY_MODE")))
