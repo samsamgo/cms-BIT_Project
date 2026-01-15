@@ -221,6 +221,15 @@ func main() {
 
 =====================
 */
+/* =====================
+   Stage 3: State Builders
+===================== */
+
+// 표시 규칙:
+// - ended=true -> "운행 종료", "ENDED"
+// - eta=nil   -> "정보 없음", "NO_DATA"
+// - eta<=60   -> "도착중",   "OK"
+// - eta>60    -> "N분",      "OK"
 func formatETA(etaSec *int, ended bool) (display string, status string) {
 	if ended {
 		return "운행 종료", "ENDED"
@@ -231,22 +240,9 @@ func formatETA(etaSec *int, ended bool) (display string, status string) {
 	if *etaSec <= 60 {
 		return "도착중", "OK"
 	}
-	min := (*etaSec + 59) / 60 // 올림
+	// 기본: 올림(125초 -> 3분)
+	min := (*etaSec + 59) / 60
 	return fmt.Sprintf("%d분", min), "OK"
-}
-
-func clampText(s string, maxLen int) string {
-	if maxLen <= 0 {
-		return ""
-	}
-	rs := []rune(s)
-	if len(rs) <= maxLen {
-		return s
-	}
-	if maxLen == 1 {
-		return string(rs[:1])
-	}
-	return string(rs[:maxLen-1]) + "…"
 }
 
 func limitRoutes(in []StateRoute, max int) []StateRoute {
@@ -259,6 +255,25 @@ func limitRoutes(in []StateRoute, max int) []StateRoute {
 	return in[:max]
 }
 
+func clampText(s string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
+	rs := []rune(s)
+	if len(rs) <= maxLen {
+		return s
+	}
+	// 길이 제한: "…" 붙이기(최소 2 이상일 때)
+	if maxLen == 1 {
+		return string(rs[:1])
+	}
+	return string(rs[:maxLen-1]) + "…"
+}
+
+// 더미 ETA 생성 규칙(테스트용):
+// - routeID%7==0 -> ended
+// - routeID%5==0 -> no data
+// - 그 외 -> 20~260초 사이 값
 func getDummyETA(routeID int) ETASnapshot {
 	if routeID%7 == 0 {
 		return ETASnapshot{ETASec: nil, Ended: true}
@@ -266,10 +281,11 @@ func getDummyETA(routeID int) ETASnapshot {
 	if routeID%5 == 0 {
 		return ETASnapshot{ETASec: nil, Ended: false}
 	}
-	sec := 20 + (routeID%9)*30
+	sec := 20 + (routeID%9)*30 // 20,50,80,...,260
 	return ETASnapshot{ETASec: &sec, Ended: false}
 }
 
+// state marshal이 실패하면 그 자체가 이상하므로, 여기서는 최소 JSON을 리턴
 func mustMarshalState(st StateResponse) []byte {
 	b, err := json.Marshal(st)
 	if err != nil {
@@ -278,6 +294,8 @@ func mustMarshalState(st StateResponse) []byte {
 	return b
 }
 
+// cached config(lastGoodRaw)를 입력으로 state를 만든다.
+// 어떤 경우에도 state 스키마는 깨지면 안 된다.
 func buildStateFromCachedConfig(displayID int) (StateResponse, []byte, error) {
 	cacheMu.RLock()
 	rawCfg := append([]byte(nil), lastGoodRaw...)
@@ -304,6 +322,7 @@ func buildStateFromCachedConfig(displayID int) (StateResponse, []byte, error) {
 		return st, mustMarshalState(st), err
 	}
 
+	// display_id 최소 확인
 	if cfg.Display.DisplayID != displayID {
 		st := StateResponse{
 			Theme:      cfg.Settings.Theme,
@@ -311,14 +330,17 @@ func buildStateFromCachedConfig(displayID int) (StateResponse, []byte, error) {
 			Notice:     "display_id mismatch",
 			Routes:     []StateRoute{},
 		}
-		return st, mustMarshalState(st), fmt.Errorf("display_id mismatch")
+		return st, mustMarshalState(st), fmt.Errorf("display_id mismatch: got %d", cfg.Display.DisplayID)
 	}
 
 	out := make([]StateRoute, 0, len(cfg.Routes))
+
+	// 정책: enabled=true만 표시
 	for _, r := range cfg.Routes {
 		if !r.Enabled {
 			continue
 		}
+
 		eta := getDummyETA(r.RouteID)
 		displayETA, status := formatETA(eta.ETASec, eta.Ended)
 
