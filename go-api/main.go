@@ -331,6 +331,11 @@ func fetchArrivalsTAGO(cityCode int, nodeId string) (map[string]ETASnapshot, err
 // - eta<=60   -> "도착중",   "OK"
 // - eta>60    -> "N분",      "OK"
 func formatETA(etaSec *int, ended bool) (display string, status string) {
+	const (
+		ETA_NO_DATA  = "정보 없음"
+		ETA_ARRIVING = "도착중"
+		ETA_ENDED    = "운행 종료"
+	)
 	if ended {
 		return "운행 종료", "ENDED"
 	}
