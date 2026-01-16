@@ -249,13 +249,7 @@ func main() {
 =====================
 */
 func getTagoServiceKey() string {
-	// 도착정보 키가 있으면 그걸 우선 사용
-	v := strings.TrimSpace(os.Getenv("TAGO_ARVL_SERVICE_KEY"))
-	if v != "" {
-		return v
-	}
-	// 호환용(예전 키명)
-	return strings.TrimSpace(os.Getenv("TAGO_SERVICE_KEY"))
+	return strings.TrimSpace(os.Getenv("TAGO_ARVL_SERVICE_KEY"))
 }
 
 func fetchArrivalsTAGO(cityCode int, nodeId string) (map[string]ETASnapshot, error) {
