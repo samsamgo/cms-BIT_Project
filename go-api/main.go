@@ -81,6 +81,33 @@ type ETASnapshot struct {
 	Ended  bool
 }
 
+// TAGO 응답이 item이 "객체"로 오거나 "배열"로 오는 경우가 있어서 둘 다 처리합니다.
+type tagoArrivalResp struct {
+	Response struct {
+		Header struct {
+			ResultCode string `json:"resultCode"`
+			ResultMsg  string `json:"resultMsg"`
+		} `json:"header"`
+		Body struct {
+			Items struct {
+				Item json.RawMessage `json:"item"`
+			} `json:"items"`
+			TotalCount int `json:"totalCount"`
+		} `json:"body"`
+	} `json:"response"`
+}
+
+type tagoArrivalItem struct {
+	ArrPrevStationCnt int    `json:"arrprevstationcnt"`
+	ArrTime           int    `json:"arrtime"` // seconds
+	NodeID            string `json:"nodeid"`
+	NodeNm            string `json:"nodenm"`
+	RouteID           string `json:"routeid"`
+	RouteNo           int    `json:"routeno"`
+	RouteTp           string `json:"routetp"`
+	VehicleTp         string `json:"vehicletp"`
+}
+
 /* =====================
    Cache (last_good_raw)
 ===================== */
@@ -221,6 +248,79 @@ func main() {
 
 =====================
 */
+func getTagoServiceKey() string {
+	return strings.TrimSpace(os.Getenv("TAGO_SERVICE_KEY"))
+}
+
+func fetchArrivalsTAGO(cityCode int, nodeId string) (map[string]ETASnapshot, error) {
+	key := getTagoServiceKey()
+	if key == "" {
+		return nil, fmt.Errorf("TAGO_SERVICE_KEY is empty")
+	}
+
+	// 정류장 기준 도착예정정보
+	// GET /1613000/ArvlInfoInqireService/getSttnAcctoArvlPrearngeInfoList
+	u := fmt.Sprintf(
+		"https://apis.data.go.kr/1613000/ArvlInfoInqireService/getSttnAcctoArvlPrearngeInfoList?serviceKey=%s&_type=json&cityCode=%d&nodeId=%s&numOfRows=30&pageNo=1",
+		key, cityCode, nodeId,
+	)
+
+	req, _ := http.NewRequest("GET", u, nil)
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("tago request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("tago error: %s", string(b))
+	}
+
+	var decoded tagoArrivalResp
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return nil, err
+	}
+
+	// item 파싱(객체 or 배열)
+	items := make([]tagoArrivalItem, 0)
+	raw := decoded.Response.Body.Items.Item
+	if len(raw) == 0 || string(raw) == "null" {
+		return map[string]ETASnapshot{}, nil
+	}
+
+	// 배열 시도
+	var arr []tagoArrivalItem
+	if err := json.Unmarshal(raw, &arr); err == nil {
+		items = arr
+	} else {
+		// 객체 시도
+		var one tagoArrivalItem
+		if err2 := json.Unmarshal(raw, &one); err2 == nil {
+			items = append(items, one)
+		} else {
+			return nil, fmt.Errorf("unexpected item format")
+		}
+	}
+
+	// routeno -> ETA snapshot
+	out := make(map[string]ETASnapshot, len(items))
+	for _, it := range items {
+		sec := it.ArrTime
+		// arrtime이 0이거나 음수면 데이터 이상으로 보고 nil 처리
+		if sec <= 0 {
+			out[strconv.Itoa(it.RouteNo)] = ETASnapshot{ETASec: nil, Ended: false}
+			continue
+		}
+		tmp := sec
+		out[strconv.Itoa(it.RouteNo)] = ETASnapshot{ETASec: &tmp, Ended: false}
+	}
+
+	return out, nil
+}
+
 /* =====================
    Stage 3: State Builders
 ===================== */
@@ -334,14 +434,31 @@ func buildStateFromCachedConfig(displayID int) (StateResponse, []byte, error) {
 	}
 
 	out := make([]StateRoute, 0, len(cfg.Routes))
-
+	// ✅ 실제 TAGO 도착정보 가져오기 (대전, 용운마젤란아파트)
+	arrMap, arrErr := fetchArrivalsTAGO(25, "DJB8002304")
+	if arrErr != nil {
+		addFailLog("tago_arrivals", arrErr)
+	}
 	// 정책: enabled=true만 표시
 	for _, r := range cfg.Routes {
 		if !r.Enabled {
 			continue
 		}
 
-		eta := getDummyETA(r.RouteID)
+		var eta ETASnapshot
+		// route_name을 버스번호("605","608")로 쓰는 정책
+		busNo := strings.TrimSpace(r.RouteName)
+
+		if arrErr != nil {
+			// TAGO 실패면 더미로 폴백(테스트 유지)
+			eta = getDummyETA(r.RouteID)
+		} else {
+			if snap, ok := arrMap[busNo]; ok {
+				eta = snap
+			} else {
+				eta = ETASnapshot{ETASec: nil, Ended: false} // 정보 없음
+			}
+		}
 		displayETA, status := formatETA(eta.ETASec, eta.Ended)
 
 		out = append(out, StateRoute{
