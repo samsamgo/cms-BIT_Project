@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -441,6 +442,12 @@ func buildStateFromCachedConfig(displayID int) (StateResponse, []byte, error) {
 	out := make([]StateRoute, 0, len(cfg.Routes))
 	// ✅ 실제 TAGO 도착정보 가져오기 (대전, 용운마젤란아파트)
 	arrMap, arrErr := fetchArrivalsTAGO(25, "DJB8002304")
+	keys := make([]string, 0, len(arrMap))
+	for k := range arrMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	log.Printf("[TAGO] arrival route keys=%v err=%v", keys, arrErr)
 	if arrErr != nil {
 		addFailLog("tago_arrivals", arrErr)
 	}
