@@ -1,4 +1,4 @@
-﻿import express from "express";
+import express from "express";
 import fs from "fs";
 import path from "path";
 import { chromium } from "playwright";
@@ -29,6 +29,7 @@ app.post("/render", async (req, res) => {
 
     await page.setContent(html, { waitUntil: "load" });
 
+    // 폰트 로드 대기(흔들림 방지)
     await page.evaluate(async () => {
       if (document.fonts && document.fonts.ready) await document.fonts.ready;
     });
