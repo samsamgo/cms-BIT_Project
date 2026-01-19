@@ -1,0 +1,80 @@
+﻿<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BIT Display</title>
+  <style>
+    * { box-sizing: border-box; transition: none !important; animation: none !important; }
+    html, body { margin: 0; padding: 0; background: #000; overflow: hidden; }
+    #canvas{
+      width:320px; height:160px;
+      background:#000; color:#fff;
+      font-family:"Noto Sans KR","Malgun Gothic",sans-serif;
+      font-size:14px; line-height:1.2;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: geometricPrecision;
+    }
+    .header{
+      height:28px; padding:6px 10px;
+      display:flex; align-items:center; justify-content:space-between;
+      border-bottom:1px solid #222;
+    }
+    .title{ font-weight:700; font-size:14px; }
+    .notice{ font-size:12px; color:#bbb; max-width:210px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .list{ padding:8px 10px; display:flex; flex-direction:column; gap:6px; }
+    .row{
+      display:flex; justify-content:space-between; align-items:baseline;
+      padding:4px 6px; border:1px solid #222; border-radius:6px;
+    }
+    .route{ font-weight:700; max-width:220px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .eta{ font-weight:800; font-size:16px; }
+    .status{ font-size:11px; color:#888; margin-left:8px; }
+  </style>
+</head>
+<body>
+  <div id="canvas">
+    <div class="header">
+      <div class="title">버스 도착정보</div>
+      <div class="notice" id="notice"></div>
+    </div>
+    <div class="list" id="list"></div>
+  </div>
+
+  <script>
+    const payload = window.__PAYLOAD__ || {};
+    const state = payload.state || {};
+    document.getElementById("notice").textContent = state.notice || "";
+
+    const listEl = document.getElementById("list");
+    listEl.innerHTML = "";
+    for (const r of (state.routes || [])) {
+      const row = document.createElement("div");
+      row.className = "row";
+
+      const left = document.createElement("div");
+      left.className = "route";
+      left.textContent = r.route || "";
+
+      const right = document.createElement("div");
+      right.style.display = "flex";
+      right.style.alignItems = "baseline";
+
+      const eta = document.createElement("div");
+      eta.className = "eta";
+      eta.textContent = r.display_eta || "";
+
+      const st = document.createElement("div");
+      st.className = "status";
+      st.textContent = r.status || "";
+
+      right.appendChild(eta);
+      right.appendChild(st);
+
+      row.appendChild(left);
+      row.appendChild(right);
+      listEl.appendChild(row);
+    }
+  </script>
+</body>
+</html>
