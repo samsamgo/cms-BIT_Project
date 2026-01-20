@@ -583,7 +583,7 @@ func validateConfig(cfg DisplayConfig) error {
 func getDirectusURL() string {
 	directusURL := os.Getenv("DIRECTUS_URL")
 	if directusURL == "" {
-		directusURL = "http://localhost:8055"
+		directusURL = "http://127.0.0.1:8055"
 	}
 	return directusURL
 }

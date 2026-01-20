@@ -1,0 +1,11 @@
+﻿{
+  "width": 320,
+  "height": 160,
+  "state": {
+    "notice": "",
+    "routes": [
+      { "route": "605번", "display_eta": "12분", "status": "OK" },
+      { "route": "608번", "display_eta": "도착중", "status": "OK" }
+    ]
+  }
+}
