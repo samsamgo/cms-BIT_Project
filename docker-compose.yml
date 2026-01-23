@@ -1,42 +1,99 @@
+version: "3.8"
+
 services:
-  renderer:
-    build: ./renderer-service
-    ports:
-      - "3000:3000"
   postgres:
-    image: postgres:16-alpine
-    container_name: app-postgres
+    image: postgres:15-alpine
+    container_name: cms_postgres
     restart: unless-stopped
     environment:
-      POSTGRES_DB: app
-      POSTGRES_USER: app
-      POSTGRES_PASSWORD: app_pw_change_me
+      POSTGRES_DB: ${POSTGRES_DB:-directus}
+      POSTGRES_USER: ${POSTGRES_USER:-directus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-directus_password}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
 
-  cms:
-    image: directus/directus:latest
-    container_name: app-cms
+  directus:
+    image: directus/directus:10.12.1
+    container_name: cms_directus
     restart: unless-stopped
     depends_on:
       - postgres
     environment:
-      KEY: ${DIRECTUS_KEY}
-      SECRET: ${DIRECTUS_SECRET}
+      KEY: ${DIRECTUS_KEY:-replace_me}
+      SECRET: ${DIRECTUS_SECRET:-replace_me}
 
-      DB_CLIENT: pg
+      DB_CLIENT: "pg"
       DB_HOST: postgres
       DB_PORT: 5432
-      DB_DATABASE: ${POSTGRES_DB}
-      DB_USER: ${POSTGRES_USER}
-      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_DATABASE: ${POSTGRES_DB:-directus}
+      DB_USER: ${POSTGRES_USER:-directus}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-directus_password}
 
-      ADMIN_EMAIL: ${DIRECTUS_ADMIN_EMAIL}
-      ADMIN_PASSWORD: ${DIRECTUS_ADMIN_PASSWORD}
+      # 최초 관리자(운영에서는 더 강하게/다르게 관리 권장)
+      ADMIN_EMAIL: ${DIRECTUS_ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${DIRECTUS_ADMIN_PASSWORD:-admin_password}
+
+      WEBSOCKETS_ENABLED: "true"
+      PUBLIC_URL: ${DIRECTUS_PUBLIC_URL:-http://localhost:8055}
+
+    volumes:
+      - directus_uploads:/directus/uploads
+      - directus_extensions:/directus/extensions
     ports:
       - "8055:8055"
 
+  renderer:
+    build:
+      context: ./renderer-service
+      dockerfile: Dockerfile
+    container_name: cms_renderer
+    restart: unless-stopped
+    environment:
+      PORT: "3000"
+      TEMPLATE_PATH: "/app/template.html"
+    ports:
+      - "3000:3000"
+
+  go-api:
+    build:
+      context: ./go-api
+      dockerfile: Dockerfile
+    container_name: cms_go_api
+    restart: unless-stopped
+    depends_on:
+      - directus
+      - renderer
+    environment:
+      # Directus (go-api/main.go에서 DIRECTUS_URL 사용)
+      DIRECTUS_URL: "http://directus:8055"
+
+      # renderer-service (go-api/main.go에서 RENDERER_URL 사용)
+      RENDERER_URL: "http://renderer:3000/render"
+
+      # screen.png 저장 경로 (볼륨)
+      SCREEN_PATH: "/data/screen.png"
+
+      # TAGO (필수 값들은 .env에서 주입 권장)
+      TAGO_CITY_CODE: ${TAGO_CITY_CODE:-}
+      TAGO_NODE_ID: ${TAGO_NODE_ID:-}
+      TAGO_ARVL_SERVICE_KEY: ${TAGO_ARVL_SERVICE_KEY:-}
+
+      # 개발 편의 (운영에서는 기본 false 권장)
+      ALLOW_DUMMY_ETA: ${ALLOW_DUMMY_ETA:-0}
+      DUMMY_MODE: ${DUMMY_MODE:-0}
+
+      # 선택: 렌더 주기 강제(없으면 settings.refresh_sec 사용)
+      # RENDER_INTERVAL_SEC: "5"
+
+    volumes:
+      - screen:/data
+    ports:
+      - "8080:8080"
+
 volumes:
-  pgdata:
+  pg_data: {}
+  directus_uploads: {}
+  directus_extensions: {}
+  screen: {}

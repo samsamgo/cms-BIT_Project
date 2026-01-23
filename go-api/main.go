@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -147,8 +151,7 @@ func addFailLog(where string, err error) {
 }
 
 /* =====================
-   TAGO Cache (BIT급)
-   - /state 요청마다 TAGO 치지 않음
+   TAGO Cache (BIT급) - /state 요청마다 TAGO 치지 않음
 ===================== */
 
 var (
@@ -191,6 +194,194 @@ func getTagoCacheCopy() (map[string]ETASnapshot, time.Time, string, []string) {
 	}
 	keys := append([]string(nil), tagoLastKeys...)
 	return out, tagoLastAt, tagoLastErr, keys
+}
+
+/* =====================
+   Render Pipeline (state -> PNG)
+===================== */
+
+var (
+	renderMu      sync.Mutex
+	renderRunning bool
+	lastStateHash string
+)
+
+func getenvDefault(k, def string) string {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+func getenvIntDefault(k string, def int) int {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+func atomicWriteFile(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func callRendererPNG(rendererURL string, width, height int, st StateResponse) ([]byte, error) {
+	payload := map[string]any{
+		"width":  width,
+		"height": height,
+		"state":  st,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", rendererURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("renderer request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("renderer status=%d body=%s", resp.StatusCode, string(b))
+	}
+	ct := resp.Header.Get("Content-Type")
+	if !strings.Contains(ct, "image/png") {
+		return nil, fmt.Errorf("renderer invalid content-type=%s", ct)
+	}
+	return b, nil
+}
+
+func getCachedDisplaySizeFallback() (int, int) {
+	cacheMu.RLock()
+	rawCfg := append([]byte(nil), lastGoodRaw...)
+	cacheMu.RUnlock()
+
+	// 기본값
+	w, h := 320, 160
+	if len(rawCfg) == 0 {
+		return w, h
+	}
+
+	var cfg DisplayConfig
+	if err := json.Unmarshal(rawCfg, &cfg); err != nil {
+		return w, h
+	}
+	if cfg.Display.Width > 0 {
+		w = cfg.Display.Width
+	}
+	if cfg.Display.Height > 0 {
+		h = cfg.Display.Height
+	}
+	return w, h
+}
+
+func startRenderRefresher() {
+	// renderer-service의 POST /render 를 직접 가리키도록 통일
+	// 예: http://renderer:3000/render
+	rendererURL := getenvDefault("RENDERER_URL", "http://renderer:3000/render")
+	screenPath := getenvDefault("SCREEN_PATH", "/data/screen.png")
+
+	// env로 주기 강제 가능
+	overrideSec := getenvIntDefault("RENDER_INTERVAL_SEC", 0)
+
+	go func() {
+		// 첫 렌더는 빠르게(부팅 직후 화면 준비)
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			// 동시 렌더 방지
+			renderMu.Lock()
+			if renderRunning {
+				renderMu.Unlock()
+				continue
+			}
+			renderRunning = true
+			renderMu.Unlock()
+
+			func() {
+				defer func() {
+					renderMu.Lock()
+					renderRunning = false
+					renderMu.Unlock()
+				}()
+
+				// state 생성(캐시 없으면 refresh 시도)
+				cacheMu.RLock()
+				hasCache := len(lastGoodRaw) > 0
+				cacheMu.RUnlock()
+				if !hasCache {
+					_ = refreshCacheOnce()
+				}
+
+				st, _, err := buildStateFromCachedConfig(1)
+				if err != nil {
+					addFailLog("render_state_build", err)
+					// 실패해도 기존 screen.png 유지
+					return
+				}
+
+				// 주기 결정: env override > state.refresh_sec > 5
+				intervalSec := 5
+				if overrideSec > 0 {
+					intervalSec = overrideSec
+				} else if st.RefreshSec > 0 {
+					intervalSec = st.RefreshSec
+				}
+				if intervalSec < 1 {
+					intervalSec = 1
+				}
+				ticker.Reset(time.Duration(intervalSec) * time.Second)
+
+				// display size (Directus 우선, fallback 320x160)
+				w, h := getCachedDisplaySizeFallback()
+
+				// 동일 state면 렌더 스킵(선택 기능)
+				rawForHash, err := json.Marshal(st)
+				if err == nil {
+					hv := sha256Hex(rawForHash)
+					if hv == lastStateHash {
+						return
+					}
+					lastStateHash = hv
+				}
+
+				png, err := callRendererPNG(rendererURL, w, h, st)
+				if err != nil {
+					addFailLog("renderer_call", err)
+					// 실패 시 기존 screen.png 유지
+					return
+				}
+				if err := atomicWriteFile(screenPath, png); err != nil {
+					addFailLog("screen_write", err)
+					return
+				}
+			}()
+		}
+	}()
 }
 
 /* =====================
@@ -293,14 +484,23 @@ func fetchArrivalsTAGO(cityCode int, nodeId string) (map[string]ETASnapshot, err
 		return nil, fmt.Errorf("TAGO_ARVL_SERVICE_KEY is empty")
 	}
 
-	u := fmt.Sprintf(
-		"https://apis.data.go.kr/1613000/ArvlInfoInqireService/getSttnAcctoArvlPrearngeInfoList?serviceKey=%s&_type=json&cityCode=%d&nodeId=%s&numOfRows=30&pageNo=1",
-		key, cityCode, nodeId,
-	)
+	base := "https://apis.data.go.kr/1613000/ArvlInfoInqireService/getSttnAcctoArvlPrearngeInfoList"
+	u, err := url.Parse(base)
+	if err != nil {
+		return nil, fmt.Errorf("invalid tago base url: %w", err)
+	}
+	q := u.Query()
+	q.Set("serviceKey", key)
+	q.Set("_type", "json")
+	q.Set("cityCode", strconv.Itoa(cityCode))
+	q.Set("nodeId", nodeId)
+	q.Set("numOfRows", "30")
+	q.Set("pageNo", "1")
+	u.RawQuery = q.Encode()
 
-	req, _ := http.NewRequest("GET", u, nil)
+	req, _ := http.NewRequest("GET", u.String(), nil)
+
 	client := &http.Client{Timeout: 5 * time.Second}
-
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("tago request failed: %w", err)
@@ -351,7 +551,6 @@ func fetchArrivalsTAGO(cityCode int, nodeId string) (map[string]ETASnapshot, err
 		tmp := sec
 		out[k] = ETASnapshot{ETASec: &tmp, Ended: false}
 	}
-
 	return out, nil
 }
 
@@ -361,9 +560,9 @@ func fetchArrivalsTAGO(cityCode int, nodeId string) (map[string]ETASnapshot, err
 
 // 표시 규칙(문구 상수화):
 // - ended=true -> "운행 종료", "ENDED"
-// - eta=nil   -> "정보 없음", "NO_DATA"
-// - eta<=60   -> "도착중",   "OK"
-// - eta>60    -> "N분",      "OK"
+// - eta=nil -> "정보 없음", "NO_DATA"
+// - eta<=60 -> "도착중", "OK"
+// - eta>60 -> "N분", "OK"
 func formatETA(etaSec *int, ended bool) (display string, status string) {
 	if ended {
 		return "운행 종료", "ENDED"
@@ -418,24 +617,20 @@ func buildStateFromCachedConfig(displayID int) (StateResponse, []byte, error) {
 		return st, mustMarshalState(st), err
 	}
 
-	// display_id 최소 확인
-	if cfg.Display.DisplayID != displayID {
-		st := StateResponse{
-			Theme:      cfg.Settings.Theme,
-			RefreshSec: cfg.Settings.RefreshSec,
-			Notice:     "display_id mismatch",
-			Routes:     []StateRoute{},
-		}
-		return st, mustMarshalState(st), fmt.Errorf("display_id mismatch: got %d", cfg.Display.DisplayID)
-	}
+	// display_id 확인(하드 실패로 막지 말고 notice로만 남김)
+	mismatch := (displayID > 0 && cfg.Display.DisplayID != displayID)
 
 	// TAGO 캐시 사용 (요청마다 fetch 금지)
 	arrMap, _, tagoErr, _ := getTagoCacheCopy()
 
-	notice := ""
-	if tagoErr != "" {
-		notice = "실시간 조회 실패"
+	noticeParts := make([]string, 0, 2)
+	if mismatch {
+		noticeParts = append(noticeParts, "display_id mismatch")
 	}
+	if tagoErr != "" {
+		noticeParts = append(noticeParts, "실시간 조회 실패")
+	}
+	notice := strings.Join(noticeParts, " | ")
 
 	out := make([]StateRoute, 0, len(cfg.Routes))
 
@@ -507,16 +702,16 @@ func isDummyMode() bool {
 func buildDummyConfig() (DisplayConfig, []byte, error) {
 	cfg := DisplayConfig{
 		Display: Display{
-			ID:        0,
+			ID:        2,
 			DisplayID: 1,
-			Name:      "DUMMY Display",
+			Name:      "Test Display",
 			Width:     320,
 			Height:    160,
 		},
 		Settings: Setting{
-			ID:         0,
-			Theme:      "dummy",
-			RefreshSec: 30,
+			ID:         1,
+			Theme:      "default",
+			RefreshSec: 5,
 			Font:       "NOTO Sans KR",
 			MaxRoutes:  5,
 		},
@@ -526,92 +721,207 @@ func buildDummyConfig() (DisplayConfig, []byte, error) {
 			Enabled   bool   `json:"enabled"`
 			SortOrder int    `json:"sort_order"`
 		}{
-			{RouteID: 1, RouteName: "DUMMY-A", Enabled: true, SortOrder: 1},
-			{RouteID: 2, RouteName: "DUMMY-B", Enabled: true, SortOrder: 2},
+			{RouteID: 10, RouteName: "A노선", Enabled: true, SortOrder: 1},
+			{RouteID: 12, RouteName: "B노선", Enabled: true, SortOrder: 2},
 		},
 	}
 
 	raw, err := json.Marshal(cfg)
 	if err != nil {
-		return DisplayConfig{}, nil, err
+		return cfg, nil, err
 	}
 	return cfg, raw, nil
 }
 
 /* =====================
-   Directus config fetch
+   Directus fetch (Stage 1/2)
 ===================== */
 
-func validateConfig(cfg DisplayConfig) error {
-	if cfg.Display.DisplayID != 1 {
-		return fmt.Errorf("invalid display_id: %d", cfg.Display.DisplayID)
-	}
-	if cfg.Display.Width <= 0 || cfg.Display.Height <= 0 {
-		return fmt.Errorf("invalid display size: %dx%d", cfg.Display.Width, cfg.Display.Height)
-	}
-
-	if cfg.Settings.Theme == "" {
-		return fmt.Errorf("settings.theme is empty")
-	}
-	if cfg.Settings.RefreshSec <= 0 {
-		return fmt.Errorf("settings.refresh_sec must be > 0")
-	}
-	if cfg.Settings.Font == "" {
-		return fmt.Errorf("settings.font is empty")
-	}
-	if cfg.Settings.MaxRoutes <= 0 {
-		return fmt.Errorf("settings.max_routes must be > 0")
-	}
-
-	if len(cfg.Routes) == 0 {
-		return fmt.Errorf("routes is empty")
-	}
-	for i, r := range cfg.Routes {
-		if r.RouteID <= 0 {
-			return fmt.Errorf("routes[%d].route_id must be > 0", i)
-		}
-		if r.RouteName == "" {
-			return fmt.Errorf("routes[%d].route_name is empty", i)
-		}
-		if r.SortOrder <= 0 {
-			return fmt.Errorf("routes[%d].sort_order must be > 0", i)
-		}
-	}
-	return nil
+type directusDisplayItem struct {
+	ID        int    `json:"id"`
+	DisplayID int    `json:"display_id"`
+	Name      string `json:"name"`
+	Width     int    `json:"width"`
+	Height    int    `json:"height"`
 }
 
-func getDirectusURL() string {
-	directusURL := os.Getenv("DIRECTUS_URL")
-	if directusURL == "" {
-		directusURL = "http://127.0.0.1:8055"
-	}
-	return directusURL
+type directusSettingItem struct {
+	ID         int    `json:"id"`
+	Theme      string `json:"theme"`
+	RefreshSec int    `json:"refresh_sec"`
+	Font       string `json:"font"`
+	MaxRoutes  int    `json:"max_routes"`
 }
 
-func refreshCacheOnce() error {
-	if isDummyMode() {
-		_, raw, err := buildDummyConfig()
-		if err != nil {
-			addFailLog("dummy_build", err)
-			return err
-		}
+type directusRouteItem struct {
+	ID        int    `json:"id"`
+	RouteID   int    `json:"route_id"`
+	RouteName string `json:"route_name"`
+	Enabled   bool   `json:"enabled"`
+}
 
-		cacheMu.Lock()
-		lastGoodRaw = raw
-		lastGoodAt = time.Now()
-		lastErr = ""
-		cacheMu.Unlock()
-		return nil
-	}
+type directusDisplayRouteItem struct {
+	ID        int `json:"id"`
+	DisplayID int `json:"display_id"`
+	RouteID   int `json:"route_id"`
+	SortOrder int `json:"sort_order"`
+}
 
-	directusURL := getDirectusURL()
-	_, raw, err := buildConfig(directusURL)
+type directusListResp[T any] struct {
+	Data []T `json:"data"`
+}
+
+func getDirectusBaseURL() string {
+	return strings.TrimRight(strings.TrimSpace(os.Getenv("DIRECTUS_URL")), "/")
+}
+
+func fetchJSON(url string, out any) error {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
 	if err != nil {
-		cacheMu.Lock()
-		lastErr = err.Error()
-		cacheMu.Unlock()
 		return err
 	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("directus error %d: %s", resp.StatusCode, string(b))
+	}
+
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// Directus에서 display(1) + setting(1) + display_routes + routes 조합해서 최종 config JSON을 만든다.
+func fetchConfigFromDirectus(displayID int) (DisplayConfig, []byte, error) {
+	if isDummyMode() {
+		return buildDummyConfig()
+	}
+
+	base := getDirectusBaseURL()
+	if base == "" {
+		return DisplayConfig{}, nil, fmt.Errorf("DIRECTUS_URL is empty")
+	}
+
+	// 1) display
+	var dispResp directusListResp[directusDisplayItem]
+	if err := fetchJSON(fmt.Sprintf("%s/items/displays?filter[display_id][_eq]=%d&limit=1", base, displayID), &dispResp); err != nil {
+		return DisplayConfig{}, nil, err
+	}
+	if len(dispResp.Data) == 0 {
+		return DisplayConfig{}, nil, fmt.Errorf("display not found for display_id=%d", displayID)
+	}
+	disp := dispResp.Data[0]
+
+	// 2) setting (display_id 기준이 아니라 그냥 1개만 쓰는 정책이면 limit=1)
+	//    (기존 프로젝트 정책 유지)
+	var setResp directusListResp[directusSettingItem]
+	if err := fetchJSON(fmt.Sprintf("%s/items/settings?limit=1", base), &setResp); err != nil {
+		return DisplayConfig{}, nil, err
+	}
+	if len(setResp.Data) == 0 {
+		return DisplayConfig{}, nil, fmt.Errorf("settings not found")
+	}
+	set := setResp.Data[0]
+
+	// 3) display_routes (display_id로 필터)
+	var drResp directusListResp[directusDisplayRouteItem]
+	if err := fetchJSON(fmt.Sprintf("%s/items/display_routes?filter[display_id][_eq]=%d&limit=100", base, displayID), &drResp); err != nil {
+		return DisplayConfig{}, nil, err
+	}
+
+	// 4) routes 전체(또는 필요한 것만)
+	var rResp directusListResp[directusRouteItem]
+	if err := fetchJSON(fmt.Sprintf("%s/items/routes?limit=500", base), &rResp); err != nil {
+		return DisplayConfig{}, nil, err
+	}
+
+	routeMap := make(map[int]directusRouteItem, len(rResp.Data))
+	for _, r := range rResp.Data {
+		routeMap[r.RouteID] = r
+	}
+
+	// display_routes + routes merge
+	type mergedRoute struct {
+		RouteID   int    `json:"route_id"`
+		RouteName string `json:"route_name"`
+		Enabled   bool   `json:"enabled"`
+		SortOrder int    `json:"sort_order"`
+	}
+
+	merged := make([]mergedRoute, 0, len(drResp.Data))
+	for _, dr := range drResp.Data {
+		ri, ok := routeMap[dr.RouteID]
+		if !ok {
+			continue
+		}
+		merged = append(merged, mergedRoute{
+			RouteID:   ri.RouteID,
+			RouteName: ri.RouteName,
+			Enabled:   ri.Enabled,
+			SortOrder: dr.SortOrder,
+		})
+	}
+
+	sort.SliceStable(merged, func(i, j int) bool {
+		return merged[i].SortOrder < merged[j].SortOrder
+	})
+
+	cfg := DisplayConfig{
+		Display: Display{
+			ID:        disp.ID,
+			DisplayID: disp.DisplayID,
+			Name:      disp.Name,
+			Width:     disp.Width,
+			Height:    disp.Height,
+		},
+		Settings: Setting{
+			ID:         set.ID,
+			Theme:      set.Theme,
+			RefreshSec: set.RefreshSec,
+			Font:       set.Font,
+			MaxRoutes:  set.MaxRoutes,
+		},
+		Routes: make([]struct {
+			RouteID   int    `json:"route_id"`
+			RouteName string `json:"route_name"`
+			Enabled   bool   `json:"enabled"`
+			SortOrder int    `json:"sort_order"`
+		}, 0, len(merged)),
+	}
+
+	for _, mr := range merged {
+		cfg.Routes = append(cfg.Routes, struct {
+			RouteID   int    `json:"route_id"`
+			RouteName string `json:"route_name"`
+			Enabled   bool   `json:"enabled"`
+			SortOrder int    `json:"sort_order"`
+		}{
+			RouteID:   mr.RouteID,
+			RouteName: mr.RouteName,
+			Enabled:   mr.Enabled,
+			SortOrder: mr.SortOrder,
+		})
+	}
+
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return cfg, nil, err
+	}
+	return cfg, raw, nil
+}
+
+/* =====================
+   Cache Refresh (Directus)
+===================== */
+
+func refreshCacheOnce() error {
+	cfg, raw, err := fetchConfigFromDirectus(1)
+	if err != nil {
+		addFailLog("directus_fetch", err)
+		return err
+	}
+
+	_ = cfg // (현재는 raw만 캐시)
 
 	cacheMu.Lock()
 	lastGoodRaw = raw
@@ -622,239 +932,29 @@ func refreshCacheOnce() error {
 	return nil
 }
 
-func buildConfig(directusURL string) (DisplayConfig, []byte, error) {
-	settings, err := fetchSettings(directusURL)
-	if err != nil {
-		return DisplayConfig{}, nil, err
-	}
-
-	displays, err := fetchDisplays(directusURL)
-	if err != nil {
-		return DisplayConfig{}, nil, err
-	}
-
-	var display Display
-	found := false
-	for _, d := range displays {
-		if d.DisplayID == 1 {
-			display = d
-			found = true
-			break
-		}
-	}
-	if !found {
-		return DisplayConfig{}, nil, fmt.Errorf("display_id=1 not found")
-	}
-
-	links, err := fetchDisplayRoutes(directusURL, 1)
-	if err != nil {
-		return DisplayConfig{}, nil, err
-	}
-
-	routeIDs := make([]int, 0, len(links))
-	sortMap := make(map[int]int)
-	for _, l := range links {
-		routeIDs = append(routeIDs, l.RouteID)
-		sortMap[l.RouteID] = l.SortOrder
-	}
-
-	routes, err := fetchRoutesByIDs(directusURL, routeIDs)
-	if err != nil {
-		return DisplayConfig{}, nil, err
-	}
-
-	routeMap := make(map[int]Route)
-	for _, rr := range routes {
-		routeMap[rr.RouteID] = rr
-	}
-
-	cfgRoutes := make([]struct {
-		RouteID   int    `json:"route_id"`
-		RouteName string `json:"route_name"`
-		Enabled   bool   `json:"enabled"`
-		SortOrder int    `json:"sort_order"`
-	}, 0)
-
-	for _, rid := range routeIDs {
-		rr, ok := routeMap[rid]
-		if !ok {
-			continue
-		}
-		cfgRoutes = append(cfgRoutes, struct {
-			RouteID   int    `json:"route_id"`
-			RouteName string `json:"route_name"`
-			Enabled   bool   `json:"enabled"`
-			SortOrder int    `json:"sort_order"`
-		}{
-			RouteID:   rr.RouteID,
-			RouteName: rr.RouteName,
-			Enabled:   rr.Enabled,
-			SortOrder: sortMap[rid],
-		})
-	}
-
-	cfg := DisplayConfig{
-		Display:  display,
-		Settings: settings,
-		Routes:   cfgRoutes,
-	}
-
-	if err := validateConfig(cfg); err != nil {
-		return DisplayConfig{}, nil, err
-	}
-
-	raw, err := json.Marshal(cfg)
-	if err != nil {
-		return DisplayConfig{}, nil, err
-	}
-
-	return cfg, raw, nil
-}
-
-func authRequest(req *http.Request) {
-	token := os.Getenv("DIRECTUS_TOKEN")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-}
-
-func fetchSettings(directusURL string) (Setting, error) {
-	url := directusURL + "/items/settings"
-	req, _ := http.NewRequest("GET", url, nil)
-	authRequest(req)
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return Setting{}, fmt.Errorf("directus request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return Setting{}, fmt.Errorf("directus error: %s", string(b))
-	}
-
-	var result struct {
-		Data Setting `json:"data"`
-	}
-	err = json.NewDecoder(resp.Body).Decode(&result)
-	return result.Data, err
-}
-
-func fetchDisplays(directusURL string) ([]Display, error) {
-	url := directusURL + "/items/displays"
-	req, _ := http.NewRequest("GET", url, nil)
-	authRequest(req)
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("directus request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("directus error: %s", string(b))
-	}
-
-	var result struct {
-		Data []Display `json:"data"`
-	}
-	err = json.NewDecoder(resp.Body).Decode(&result)
-	return result.Data, err
-}
-
-func fetchDisplayRoutes(directusURL string, displayID int) ([]DisplayRoute, error) {
-	url := fmt.Sprintf("%s/items/display_routes?filter[display_id][_eq]=%d&sort=sort_order", directusURL, displayID)
-	req, _ := http.NewRequest("GET", url, nil)
-	authRequest(req)
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("directus request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("directus error: %s", string(b))
-	}
-
-	var result struct {
-		Data []DisplayRoute `json:"data"`
-	}
-	err = json.NewDecoder(resp.Body).Decode(&result)
-	return result.Data, err
-}
-
-func fetchRoutesByIDs(directusURL string, ids []int) ([]Route, error) {
-	if len(ids) == 0 {
-		return []Route{}, nil
-	}
-
-	s := make([]string, 0, len(ids))
-	for _, id := range ids {
-		s = append(s, strconv.Itoa(id))
-	}
-	in := strings.Join(s, ",")
-
-	url := fmt.Sprintf("%s/items/routes?filter[route_id][_in]=%s", directusURL, in)
-	req, _ := http.NewRequest("GET", url, nil)
-	authRequest(req)
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("directus request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("directus error: %s", string(b))
-	}
-
-	var result struct {
-		Data []Route `json:"data"`
-	}
-	err = json.NewDecoder(resp.Body).Decode(&result)
-	return result.Data, err
-}
-
 /* =====================
-   TAGO refresher (5s)
+   TAGO refresher (Stage 2 cache)
 ===================== */
 
 func startTagoRefresher() {
-	// 시작 시 한 번 돌리고, 이후 주기
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 
-		for {
-			// 1회 실행
-			city, node, err := getTagoCityNode()
+		for range ticker.C {
+			cityCode, nodeID, err := getTagoCityNode()
 			if err != nil {
 				setTagoCache(nil, err)
-				log.Printf("[TAGO] refresh failed: %v", err)
-			} else {
-				m, ferr := fetchArrivalsTAGO(city, node)
-				setTagoCache(m, ferr)
-
-				_, _, e, keys := getTagoCacheCopy()
-				log.Printf("[TAGO] arrival route keys=%v err=%v", keys, e)
+				continue
 			}
-
-			<-ticker.C
+			m, err := fetchArrivalsTAGO(cityCode, nodeID)
+			setTagoCache(m, err)
 		}
 	}()
 }
 
 /* =====================
-   Main
+   Server
 ===================== */
 
 func main() {
@@ -945,6 +1045,20 @@ func main() {
 		_, _ = w.Write(rawState)
 	})
 
+	// screen.png 서빙 (BIT 단말은 이것만 GET)
+	mux.HandleFunc("/display/screen.png", func(w http.ResponseWriter, r *http.Request) {
+		screenPath := getenvDefault("SCREEN_PATH", "/data/screen.png")
+		b, err := os.ReadFile(screenPath)
+		if err != nil {
+			http.Error(w, "screen not ready", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(b)
+	})
+
 	// 시작할 때 1번 즉시 갱신(Directus 캐시)
 	_ = refreshCacheOnce()
 
@@ -959,6 +1073,9 @@ func main() {
 
 	// ✅ TAGO는 5초 주기 캐시
 	startTagoRefresher()
+
+	// ✅ state -> PNG 렌더 파이프라인 (screen.png 주기 갱신)
+	startRenderRefresher()
 
 	log.Println("go-api listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", mux))
