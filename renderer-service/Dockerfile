@@ -1,13 +1,16 @@
-FROM mcr.microsoft.com/playwright:v1.48.0-jammy
+FROM node:20-bookworm-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y fonts-noto-cjk && rm -rf /var/lib/apt/lists/*
-
-COPY package.json ./
+COPY package*.json ./
 RUN npm install --omit=dev
 
-COPY server.js template.html ./
+# ✅ playwright 브라우저 설치 (chromium만)
+RUN npx playwright install --with-deps chromium
 
+COPY . .
+
+ENV PORT=3000
 EXPOSE 3000
-CMD ["npm", "start"]
+
+CMD ["node", "server.js"]

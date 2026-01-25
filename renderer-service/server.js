@@ -1,112 +1,76 @@
 import express from "express";
-import bodyParser from "body-parser";
-import puppeteer from "puppeteer";
-import fs from "fs/promises";
+import fs from "fs";
 import path from "path";
+import { chromium } from "playwright";
 
 const app = express();
-app.use(bodyParser.json({ limit: "2mb" }));
+app.use(express.json({ limit: "1mb" }));
 
-const PORT = process.env.PORT || 3000;
-const TEMPLATE_PATH =
-  process.env.TEMPLATE_PATH || path.join(process.cwd(), "template.html");
+const TEMPLATE = fs.readFileSync(path.join(process.cwd(), "template.html"), "utf-8");
 
-let browser = null;
+app.get("/health", (req, res) => res.json({ ok: true }));
 
-async function ensureBrowser() {
-  if (browser) return browser;
-  browser = await puppeteer.launch({
-    headless: "new",
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-  });
-  return browser;
+let browserPromise = null;
+async function getBrowser() {
+  if (!browserPromise) {
+    browserPromise = chromium.launch({
+      args: ["--no-sandbox", "--disable-dev-shm-usage"]
+    });
+  }
+  return browserPromise;
 }
 
-app.get("/health", (req, res) => {
-  res.json({ ok: true });
-});
-
 app.post("/render", async (req, res) => {
-  let page = null;
   try {
     const { width, height, state } = req.body || {};
+    const W = Number(width) || 320;
+    const H = Number(height) || 160;
 
-    const w = Number(width);
-    const h = Number(height);
-
-    if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) {
-      return res.status(400).json({ error: "width/height must be positive numbers" });
+    if (W > 1920 || H > 1080) {
+      return res.status(400).json({ error: "resolution too large" });
     }
-    if (typeof state !== "object" || state === null) {
-      return res.status(400).json({ error: "state must be an object" });
+    if (!state || typeof state !== "object") {
+      return res.status(400).json({ error: "state is required" });
     }
 
-    const html = await fs.readFile(TEMPLATE_PATH, "utf-8");
-    const b = await ensureBrowser();
-    page = await b.newPage();
-
-    await page.setViewport({
-      width: Math.round(w),
-      height: Math.round(h),
-      deviceScaleFactor: 1,
+    const browser = await getBrowser();
+    const context = await browser.newContext({
+      viewport: { width: W, height: H },
+      deviceScaleFactor: 1
     });
 
-    // payload 안전 주입 (script 문자열 치환 금지)
-    const payload = { width: Math.round(w), height: Math.round(h), state };
-    await page.evaluateOnNewDocument((p) => {
-      window.__PAYLOAD__ = p;
-    }, payload);
+    const page = await context.newPage();
+
+    const html = TEMPLATE.replace(
+      "</head>",
+      `<script>window.__PAYLOAD__=${JSON.stringify({ width: W, height: H, state })}</script></head>`
+    );
 
     await page.setContent(html, { waitUntil: "domcontentloaded" });
 
-    // 흔들림 방지 강제
-    await page.addStyleTag({
-      content: `
-        * { animation: none !important; transition: none !important; }
-        html, body { margin:0 !important; padding:0 !important; overflow:hidden !important; }
-      `,
-    });
-
-    // 폰트 로드 완료 대기
+    // 폰트 로딩 대기(픽셀 흔들림 방지)
     await page.evaluate(async () => {
       if (document.fonts && document.fonts.ready) {
         await document.fonts.ready;
       }
     });
 
-    // 레이아웃 안정화: 1 frame 대기
-    await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => r())));
-
-    const canvas = await page.$("#canvas");
-    if (!canvas) {
+    const el = await page.$("#canvas");
+    if (!el) {
+      await context.close();
       return res.status(500).json({ error: "template missing #canvas" });
     }
 
-    const png = await canvas.screenshot({ type: "png" });
+    const png = await el.screenshot({ type: "png" });
+
+    await context.close();
 
     res.setHeader("Content-Type", "image/png");
-    res.setHeader("Cache-Control", "no-store");
-    res.send(png);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: String(err?.message || err) });
-  } finally {
-    if (page) {
-      try { await page.close(); } catch {}
-    }
+    res.status(200).send(png);
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-process.on("SIGINT", async () => {
-  try { if (browser) await browser.close(); } catch {}
-  process.exit(0);
-});
-process.on("SIGTERM", async () => {
-  try { if (browser) await browser.close(); } catch {}
-  process.exit(0);
-});
-
-app.listen(PORT, () => {
-  console.log(`renderer-service listening on ${PORT}`);
-  console.log(`template: ${TEMPLATE_PATH}`);
-});
+const PORT = Number(process.env.PORT) || 3000;
+app.listen(PORT, () => console.log(`renderer listening on :${PORT}`));
