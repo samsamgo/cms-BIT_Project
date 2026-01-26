@@ -1,12 +1,147 @@
-<div id="canvas"></div>
-<script>
-  const payload = window.__PAYLOAD__;
-  const W = payload?.width ?? 320;
-  const H = payload?.height ?? 160;
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      :root {
+        --bg: #0b0f14;
+        --fg: #f8fafc;
+        --muted: #94a3b8;
+        --accent: #22c55e;
+        --warn: #f59e0b;
+        --ended: #64748b;
+      }
 
-  const canvas = document.getElementById("canvas");
-  canvas.style.width = W + "px";
-  canvas.style.height = H + "px";
+      * {
+        box-sizing: border-box;
+      }
 
-  // payload.state로 화면 그리기...
-</script>
+      body {
+        margin: 0;
+        font-family: "Noto Sans KR", "Apple SD Gothic Neo", system-ui, sans-serif;
+        background: var(--bg);
+        color: var(--fg);
+      }
+
+      #canvas {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        padding: 12px 14px;
+        background: var(--bg);
+      }
+
+      header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .title {
+        font-weight: 600;
+        font-size: 14px;
+        color: var(--fg);
+      }
+
+      ul {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      li {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        font-size: 16px;
+      }
+
+      .route {
+        font-weight: 600;
+        letter-spacing: 0.2px;
+      }
+
+      .eta {
+        padding: 2px 6px;
+        border-radius: 8px;
+        font-size: 14px;
+        background: rgba(255, 255, 255, 0.08);
+      }
+
+      .eta.ok {
+        color: var(--accent);
+      }
+
+      .eta.no-data {
+        color: var(--warn);
+      }
+
+      .eta.ended {
+        color: var(--ended);
+      }
+
+      .empty {
+        font-size: 14px;
+        color: var(--muted);
+        text-align: center;
+        padding-top: 18px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="canvas">
+      <header>
+        <span class="title">실시간 버스 도착</span>
+        <span id="notice"></span>
+      </header>
+      <ul id="routes"></ul>
+      <div id="empty" class="empty" hidden>표시할 노선이 없습니다.</div>
+    </div>
+    <script>
+      const payload = window.__PAYLOAD__ ?? {};
+      const W = payload?.width ?? 320;
+      const H = payload?.height ?? 160;
+      const state = payload?.state ?? { notice: "", routes: [] };
+
+      const canvas = document.getElementById("canvas");
+      canvas.style.width = W + "px";
+      canvas.style.height = H + "px";
+
+      const noticeEl = document.getElementById("notice");
+      noticeEl.textContent = state.notice || "정상";
+
+      const routesEl = document.getElementById("routes");
+      const emptyEl = document.getElementById("empty");
+
+      const routes = Array.isArray(state.routes) ? state.routes : [];
+      if (routes.length === 0) {
+        emptyEl.hidden = false;
+      } else {
+        routes.forEach((route) => {
+          const li = document.createElement("li");
+
+          const routeName = document.createElement("span");
+          routeName.className = "route";
+          routeName.textContent = route.route ?? "-";
+
+          const eta = document.createElement("span");
+          const status = (route.status || "NO_DATA").toLowerCase();
+          eta.className = `eta ${status === "ok" ? "ok" : status === "ended" ? "ended" : "no-data"}`;
+          eta.textContent = route.display_eta ?? "정보 없음";
+
+          li.appendChild(routeName);
+          li.appendChild(eta);
+          routesEl.appendChild(li);
+        });
+      }
+
+      window.__RENDER_READY__ = true;
+    </script>
+  </body>
+</html>

@@ -41,12 +41,19 @@ app.post("/render", async (req, res) => {
 
     const page = await context.newPage();
 
-    const html = TEMPLATE.replace(
-      "</head>",
-      `<script>window.__PAYLOAD__=${JSON.stringify({ width: W, height: H, state })}</script></head>`
-    );
+    const payloadScript = `<script>window.__PAYLOAD__=${JSON.stringify({ width: W, height: H, state })}</script>`;
+    const html = TEMPLATE.includes("</head>")
+      ? TEMPLATE.replace("</head>", `${payloadScript}</head>`)
+      : `${payloadScript}${TEMPLATE}`;
 
     await page.setContent(html, { waitUntil: "domcontentloaded" });
+
+    await page.waitForFunction(() => {
+      const canvas = document.querySelector("#canvas");
+      return canvas && canvas.offsetWidth > 0 && canvas.offsetHeight > 0;
+    });
+
+    await page.waitForFunction(() => window.__RENDER_READY__ === true);
 
     // 폰트 로딩 대기(픽셀 흔들림 방지)
     await page.evaluate(async () => {
