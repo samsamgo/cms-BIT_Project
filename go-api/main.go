@@ -121,10 +121,13 @@ type tagoArrivalItem struct {
 ===================== */
 
 var (
-	cacheMu     sync.RWMutex
-	lastGoodRaw []byte
-	lastGoodAt  time.Time
-	lastErr     string
+	cacheMu      sync.RWMutex
+	lastGoodRaw  []byte
+	lastGoodAt   time.Time
+	lastErr      string
+	lastOkState  time.Time
+	lastOkPNG    time.Time
+	lastErrShort string
 
 	// 최근 50개 실패 로그
 	failLogs    []FailLog
@@ -143,6 +146,7 @@ func addFailLog(where string, err error) {
 
 	cacheMu.Lock()
 	lastErr = fl.Reason
+	lastErrShort = summarizeError(fl.Reason)
 	failLogs = append(failLogs, fl)
 	if len(failLogs) > failLogsMax {
 		failLogs = failLogs[len(failLogs)-failLogsMax:]
@@ -232,6 +236,42 @@ func atomicWriteFile(path string, data []byte) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+func sanitizeNotice(input string) string {
+	const maxLen = 24
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		return "정상"
+	}
+	var b strings.Builder
+	for _, r := range trimmed {
+		if r == '\n' || r == '\r' || r == '\t' {
+			continue
+		}
+		if r < 32 || r == 127 {
+			continue
+		}
+		if r > 0x1F000 {
+			b.WriteRune('□')
+			continue
+		}
+		b.WriteRune(r)
+	}
+	cleaned := strings.TrimSpace(b.String())
+	if cleaned == "" {
+		return "정상"
+	}
+	return clampText(cleaned, maxLen)
+}
+
+func summarizeError(input string) string {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		return ""
+	}
+	compact := strings.Join(strings.Fields(trimmed), " ")
+	return clampText(compact, 80)
 }
 
 func sha256Hex(b []byte) string {
@@ -379,6 +419,10 @@ func startRenderRefresher() {
 					addFailLog("screen_write", err)
 					return
 				}
+
+				cacheMu.Lock()
+				lastOkPNG = time.Now()
+				cacheMu.Unlock()
 			}()
 		}
 	}()
@@ -638,7 +682,7 @@ func buildStateFromCachedConfig(displayID int) (StateResponse, []byte, error) {
 	if tagoErr != "" {
 		noticeParts = append(noticeParts, "실시간 조회 실패")
 	}
-	notice := strings.Join(noticeParts, " | ")
+	notice := sanitizeNotice(strings.Join(noticeParts, " | "))
 
 	out := make([]StateRoute, 0, len(cfg.Routes))
 
@@ -694,6 +738,10 @@ func buildStateFromCachedConfig(displayID int) (StateResponse, []byte, error) {
 		}
 		return st, mustMarshalState(st), err
 	}
+
+	cacheMu.Lock()
+	lastOkState = time.Now()
+	cacheMu.Unlock()
 
 	return state, rawState, nil
 }
@@ -935,6 +983,7 @@ func refreshCacheOnce() error {
 	lastGoodRaw = raw
 	lastGoodAt = time.Now()
 	lastErr = ""
+	lastErrShort = ""
 	cacheMu.Unlock()
 
 	return nil
@@ -988,17 +1037,25 @@ func main() {
 		cacheMu.RUnlock()
 
 		_, tagoAt, tagoErr, tagoKeys := getTagoCacheCopy()
+		cacheMu.RLock()
+		lastOkStateAt := lastOkState
+		lastOkPngAt := lastOkPNG
+		lastErrShortLocal := lastErrShort
+		cacheMu.RUnlock()
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status":          "ok",
-			"cache_ready":     ok,
-			"cache_at":        at.Format(time.RFC3339),
-			"last_error":      le,
-			"recent_fails":    recent,
-			"tago_cache_at":   tagoAt.Format(time.RFC3339),
-			"tago_last_error": tagoErr,
-			"tago_last_keys":  tagoKeys,
+			"status":           "ok",
+			"cache_ready":      ok,
+			"cache_at":         at.Format(time.RFC3339),
+			"last_error":       le,
+			"last_error_short": lastErrShortLocal,
+			"recent_fails":     recent,
+			"tago_cache_at":    tagoAt.Format(time.RFC3339),
+			"tago_last_error":  tagoErr,
+			"tago_last_keys":   tagoKeys,
+			"last_ok_state_at": lastOkStateAt.Format(time.RFC3339),
+			"last_ok_png_at":   lastOkPngAt.Format(time.RFC3339),
 		})
 	})
 
@@ -1062,7 +1119,12 @@ func main() {
 			return
 		}
 		w.Header().Set("Content-Type", "image/png")
-		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
+		sum := sha256.Sum256(b)
+		w.Header().Set("ETag", fmt.Sprintf("\"%x\"", sum[:]))
+		w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(b)
 	})

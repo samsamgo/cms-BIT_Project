@@ -114,7 +114,34 @@
       canvas.style.height = H + "px";
 
       const noticeEl = document.getElementById("notice");
-      noticeEl.textContent = state.notice || "정상";
+      const sanitizeNotice = (input) => {
+        const maxLen = 24;
+        const trimmed = String(input ?? "").trim();
+        if (!trimmed) {
+          return "정상";
+        }
+        let out = "";
+        for (const ch of trimmed) {
+          const code = ch.codePointAt(0);
+          if (ch === "\n" || ch === "\r" || ch === "\t") {
+            continue;
+          }
+          if (code < 32 || code === 127) {
+            continue;
+          }
+          if (code > 0x1f000) {
+            out += "□";
+            continue;
+          }
+          out += ch;
+        }
+        const cleaned = out.trim();
+        if (!cleaned) {
+          return "정상";
+        }
+        return cleaned.length > maxLen ? cleaned.slice(0, maxLen - 1) + "…" : cleaned;
+      };
+      noticeEl.textContent = sanitizeNotice(state.notice);
 
       const routesEl = document.getElementById("routes");
       const emptyEl = document.getElementById("empty");
