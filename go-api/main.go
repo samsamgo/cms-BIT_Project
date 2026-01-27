@@ -545,10 +545,18 @@ func fetchArrivalsTAGO(cityCode int, nodeId string) (map[string]ETASnapshot, err
 
 		// arrtime <= 0은 유효하지 않은 데이터로 보고 NO_DATA 처리
 		if sec <= 0 {
-			out[k] = ETASnapshot{ETASec: nil, Ended: false}
+			if _, ok := out[k]; !ok {
+				out[k] = ETASnapshot{ETASec: nil, Ended: false}
+			}
 			continue
 		}
+
 		tmp := sec
+		if existing, ok := out[k]; ok && existing.ETASec != nil {
+			if *existing.ETASec <= sec {
+				continue
+			}
+		}
 		out[k] = ETASnapshot{ETASec: &tmp, Ended: false}
 	}
 	return out, nil
