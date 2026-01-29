@@ -5,11 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
       :root {
-        --bg-0: #0a0f14;
-        --bg-1: #0f1b2a;
-        --bg-2: #101623;
-        --panel: rgba(16, 24, 38, 0.88);
-        --panel-border: rgba(148, 163, 184, 0.18);
+        --bg-0: #0b1118;
+        --bg-1: #0b1118;
+        --bg-2: #0b1118;
+        --panel: #111c28;
+        --panel-border: rgba(148, 163, 184, 0.28);
         --fg: #f8fafc;
         --muted: #a3b1c6;
         --accent: #31d18f;
@@ -27,7 +27,7 @@
       body {
         margin: 0;
         font-family: "Noto Sans KR", "Apple SD Gothic Neo", "Nanum Gothic", sans-serif;
-        background: linear-gradient(150deg, var(--bg-0), var(--bg-1) 55%, var(--bg-2));
+        background: var(--bg-0);
         color: var(--fg);
       }
 
@@ -35,32 +35,20 @@
         position: relative;
         display: flex;
         flex-direction: column;
-        gap: 10px;
-        padding: 12px 14px;
-        background: radial-gradient(120px 90px at 88% 10%, rgba(49, 209, 143, 0.22), transparent 70%),
-          radial-gradient(120px 90px at 12% 90%, rgba(246, 176, 74, 0.2), transparent 65%),
-          linear-gradient(160deg, rgba(10, 15, 20, 0.95), rgba(10, 20, 32, 0.92));
+        gap: 4px;
+        padding: 6px 8px;
+        background: var(--bg-0);
         overflow: hidden;
-        border-radius: 10px;
+        border-radius: 4px;
       }
 
       #canvas::before,
       #canvas::after {
-        content: "";
-        position: absolute;
-        inset: 0;
-        pointer-events: none;
+        content: none;
       }
 
       #canvas::before {
-        background: repeating-linear-gradient(
-          135deg,
-          rgba(255, 255, 255, 0.03),
-          rgba(255, 255, 255, 0.03) 6px,
-          transparent 6px,
-          transparent 12px
-        );
-        opacity: 0.35;
+        opacity: 0;
       }
 
       #canvas::after {
@@ -76,13 +64,13 @@
         justify-content: space-between;
         align-items: center;
         gap: 8px;
-        font-size: 11px;
+        font-size: 9px;
         color: var(--muted);
       }
 
       .title {
         font-weight: 700;
-        font-size: 14px;
+        font-size: 11px;
         letter-spacing: 0.4px;
         color: var(--fg);
       }
@@ -91,10 +79,10 @@
         display: inline-flex;
         align-items: center;
         gap: 6px;
-        padding: 2px 8px;
+        padding: 1px 6px;
         border-radius: 999px;
-        background: rgba(148, 163, 184, 0.12);
-        border: 1px solid rgba(148, 163, 184, 0.25);
+        background: rgba(148, 163, 184, 0.08);
+        border: 1px solid rgba(148, 163, 184, 0.2);
         color: var(--muted);
         white-space: nowrap;
       }
@@ -107,7 +95,7 @@
         padding: 0;
         display: flex;
         flex-direction: column;
-        gap: 8px;
+        gap: 4px;
       }
 
       li {
@@ -115,36 +103,35 @@
         grid-template-columns: 1fr auto;
         align-items: center;
         gap: 8px;
-        padding: 8px 10px;
+        padding: 5px 6px;
         background: var(--panel);
         border: 1px solid var(--panel-border);
-        border-radius: 10px;
-        box-shadow: 0 6px 16px var(--shadow);
-        opacity: 0;
-        transform: translateY(8px);
-        animation: rise 480ms ease forwards;
+        border-radius: 6px;
+        box-shadow: none;
+        opacity: 1;
+        transform: none;
       }
 
       .route {
         font-weight: 700;
         letter-spacing: 0.3px;
-        font-size: 16px;
+        font-size: 13px;
       }
 
       .route-sub {
-        font-size: 11px;
+        font-size: 10px;
         color: var(--muted);
-        margin-top: 2px;
+        margin-top: 1px;
       }
 
       .eta {
-        padding: 4px 9px;
+        padding: 3px 7px;
         border-radius: 999px;
-        font-size: 13px;
+        font-size: 11px;
         font-weight: 700;
         background: rgba(255, 255, 255, 0.08);
         border: 1px solid rgba(255, 255, 255, 0.15);
-        min-width: 62px;
+        min-width: 50px;
         text-align: center;
       }
 
@@ -182,12 +169,6 @@
         padding-top: 18px;
       }
 
-      @keyframes rise {
-        to {
-          opacity: 1;
-          transform: translateY(0);
-        }
-      }
     </style>
   </head>
   <body>
@@ -274,7 +255,6 @@
           left.appendChild(routeSub);
           li.appendChild(left);
           li.appendChild(eta);
-          li.style.animationDelay = `${idx * 70}ms`;
           routesEl.appendChild(li);
         });
       }
