@@ -128,6 +128,7 @@ var (
 	lastOkState  time.Time
 	lastOkPNG    time.Time
 	lastErrShort string
+	activeDisplayID int
 
 	// 최근 50개 실패 로그
 	failLogs    []FailLog
