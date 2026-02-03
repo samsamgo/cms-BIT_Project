@@ -30,6 +30,8 @@ type Display struct {
 	Name      string `json:"name"`
 	Width     int    `json:"width"`
 	Height    int    `json:"height"`
+	NodeID    string `json:"node_id"`
+	Enabled   bool   `json:"enabled"`
 }
 
 type Setting struct {
@@ -66,9 +68,10 @@ type DisplayConfig struct {
 }
 
 type FailLog struct {
-	At     time.Time `json:"at"`
-	Where  string    `json:"where"`
-	Reason string    `json:"reason"`
+	At        time.Time `json:"at"`
+	DisplayID int       `json:"display_id,omitempty"`
+	Where     string    `json:"where"`
+	Reason    string    `json:"reason"`
 }
 
 type StateRoute struct {
@@ -121,33 +124,39 @@ type tagoArrivalItem struct {
 ===================== */
 
 var (
-	cacheMu      sync.RWMutex
-	lastGoodRaw  []byte
-	lastGoodAt   time.Time
-	lastErr      string
-	lastOkState  time.Time
-	lastOkPNG    time.Time
-	lastErrShort string
-	activeDisplayID int
+	cacheMu       sync.RWMutex
+	displayCaches = make(map[int]*displayCache)
 
 	// 최근 50개 실패 로그
 	failLogs    []FailLog
 	failLogsMax = 50
 )
 
-func addFailLog(where string, err error) {
+type displayCache struct {
+	Raw           []byte
+	Config        DisplayConfig
+	LastGoodAt    time.Time
+	LastErr       string
+	LastErrShort  string
+	LastOkStateAt time.Time
+	LastOkPNGAt   time.Time
+	LastStateHash string
+	NextRenderAt  time.Time
+	RenderRunning bool
+}
+
+func addFailLog(displayID int, where string, err error) {
 	if err == nil {
 		return
 	}
 	fl := FailLog{
-		At:     time.Now(),
-		Where:  where,
-		Reason: err.Error(),
+		At:        time.Now(),
+		DisplayID: displayID,
+		Where:     where,
+		Reason:    err.Error(),
 	}
 
 	cacheMu.Lock()
-	lastErr = fl.Reason
-	lastErrShort = summarizeError(fl.Reason)
 	failLogs = append(failLogs, fl)
 	if len(failLogs) > failLogsMax {
 		failLogs = failLogs[len(failLogs)-failLogsMax:]
@@ -160,56 +169,64 @@ func addFailLog(where string, err error) {
 ===================== */
 
 var (
-	tagoMu       sync.RWMutex
-	tagoLastMap  map[string]ETASnapshot
-	tagoLastAt   time.Time
-	tagoLastErr  string
-	tagoLastKeys []string // 디버깅 편의
+	tagoMu     sync.RWMutex
+	tagoCaches = make(map[int]*tagoCache)
 )
 
-func setTagoCache(m map[string]ETASnapshot, err error) {
+type tagoCache struct {
+	LastMap  map[string]ETASnapshot
+	LastAt   time.Time
+	LastErr  string
+	LastKeys []string
+}
+
+func setTagoCache(displayID int, m map[string]ETASnapshot, err error) {
 	tagoMu.Lock()
 	defer tagoMu.Unlock()
 
+	cache := tagoCaches[displayID]
+	if cache == nil {
+		cache = &tagoCache{}
+		tagoCaches[displayID] = cache
+	}
+
 	if err != nil {
-		tagoLastErr = err.Error()
+		cache.LastErr = err.Error()
 		// 실패해도 기존 캐시는 유지 (죽지 말고 흐리게)
 		return
 	}
 
-	tagoLastMap = m
-	tagoLastAt = time.Now()
-	tagoLastErr = ""
+	cache.LastMap = m
+	cache.LastAt = time.Now()
+	cache.LastErr = ""
 
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	tagoLastKeys = keys
+	cache.LastKeys = keys
 }
 
-func getTagoCacheCopy() (map[string]ETASnapshot, time.Time, string, []string) {
+func getTagoCacheCopy(displayID int) (map[string]ETASnapshot, time.Time, string, []string) {
 	tagoMu.RLock()
 	defer tagoMu.RUnlock()
 
-	out := make(map[string]ETASnapshot, len(tagoLastMap))
-	for k, v := range tagoLastMap {
+	cache := tagoCaches[displayID]
+	if cache == nil || cache.LastMap == nil {
+		return map[string]ETASnapshot{}, time.Time{}, "", nil
+	}
+	out := make(map[string]ETASnapshot, len(cache.LastMap))
+	for k, v := range cache.LastMap {
 		out[k] = v
 	}
-	keys := append([]string(nil), tagoLastKeys...)
-	return out, tagoLastAt, tagoLastErr, keys
+	keys := append([]string(nil), cache.LastKeys...)
+	return out, cache.LastAt, cache.LastErr, keys
 }
 
 /* =====================
    Render Pipeline (state -> PNG)
 ===================== */
-
-var (
-	renderMu      sync.Mutex
-	renderRunning bool
-	lastStateHash string
-)
 
 func getenvDefault(k, def string) string {
 	v := strings.TrimSpace(os.Getenv(k))
@@ -315,118 +332,185 @@ func callRendererPNG(rendererURL string, width, height int, st StateResponse) ([
 	return b, nil
 }
 
-func getCachedDisplaySizeFallback() (int, int) {
+func getCachedDisplaySizeFallback(displayID int) (int, int) {
 	cacheMu.RLock()
-	rawCfg := append([]byte(nil), lastGoodRaw...)
+	cache := displayCaches[displayID]
 	cacheMu.RUnlock()
 
 	// 기본값
 	w, h := 320, 160
-	if len(rawCfg) == 0 {
+	if cache == nil {
 		return w, h
 	}
 
-	var cfg DisplayConfig
-	if err := json.Unmarshal(rawCfg, &cfg); err != nil {
-		return w, h
+	if cache.Config.Display.Width > 0 {
+		w = cache.Config.Display.Width
 	}
-	if cfg.Display.Width > 0 {
-		w = cfg.Display.Width
-	}
-	if cfg.Display.Height > 0 {
-		h = cfg.Display.Height
+	if cache.Config.Display.Height > 0 {
+		h = cache.Config.Display.Height
 	}
 	return w, h
+}
+
+func screenPathForDisplay(displayID int) string {
+	if displayID == 1 {
+		if legacy := strings.TrimSpace(os.Getenv("SCREEN_PATH")); legacy != "" {
+			return legacy
+		}
+	}
+	pattern := getenvDefault("SCREEN_PATH_PATTERN", "/data/screen_%d.png")
+	return fmt.Sprintf(pattern, displayID)
 }
 
 func startRenderRefresher() {
 	// renderer-service의 POST /render 를 직접 가리키도록 통일
 	// 예: http://renderer:3000/render
 	rendererURL := getenvDefault("RENDERER_URL", "http://renderer:3000/render")
-	screenPath := getenvDefault("SCREEN_PATH", "/data/screen.png")
 
 	// env로 주기 강제 가능
 	overrideSec := getenvIntDefault("RENDER_INTERVAL_SEC", 0)
+	concurrency := getenvIntDefault("RENDER_CONCURRENCY", 1)
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	sem := make(chan struct{}, concurrency)
 
 	go func() {
-		// 첫 렌더는 빠르게(부팅 직후 화면 준비)
-		ticker := time.NewTicker(2 * time.Second)
+		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 
 		for range ticker.C {
-			// 동시 렌더 방지
-			renderMu.Lock()
-			if renderRunning {
-				renderMu.Unlock()
-				continue
+			displayIDs := getCachedDisplayIDs()
+			for _, displayID := range displayIDs {
+				if !isDisplayEnabled(displayID) {
+					continue
+				}
+				if !markRenderRunningIfDue(displayID) {
+					continue
+				}
+				go func(id int) {
+					sem <- struct{}{}
+					defer func() {
+						<-sem
+						markRenderDone(id)
+					}()
+					renderOneDisplay(rendererURL, overrideSec, id)
+				}(displayID)
 			}
-			renderRunning = true
-			renderMu.Unlock()
-
-			func() {
-				defer func() {
-					renderMu.Lock()
-					renderRunning = false
-					renderMu.Unlock()
-				}()
-
-				// state 생성(캐시 없으면 refresh 시도)
-				cacheMu.RLock()
-				hasCache := len(lastGoodRaw) > 0
-				cacheMu.RUnlock()
-				if !hasCache {
-					_ = refreshCacheOnce()
-				}
-
-				st, _, err := buildStateFromCachedConfig(1)
-				if err != nil {
-					addFailLog("render_state_build", err)
-					// 실패해도 기존 screen.png 유지
-					return
-				}
-
-				// 주기 결정: env override > state.refresh_sec > 5
-				intervalSec := 5
-				if overrideSec > 0 {
-					intervalSec = overrideSec
-				} else if st.RefreshSec > 0 {
-					intervalSec = st.RefreshSec
-				}
-				if intervalSec < 1 {
-					intervalSec = 1
-				}
-				ticker.Reset(time.Duration(intervalSec) * time.Second)
-
-				// display size (Directus 우선, fallback 320x160)
-				w, h := getCachedDisplaySizeFallback()
-
-				// 동일 state면 렌더 스킵(선택 기능)
-				rawForHash, err := json.Marshal(st)
-				if err == nil {
-					hv := sha256Hex(rawForHash)
-					if hv == lastStateHash {
-						return
-					}
-					lastStateHash = hv
-				}
-
-				png, err := callRendererPNG(rendererURL, w, h, st)
-				if err != nil {
-					addFailLog("renderer_call", err)
-					// 실패 시 기존 screen.png 유지
-					return
-				}
-				if err := atomicWriteFile(screenPath, png); err != nil {
-					addFailLog("screen_write", err)
-					return
-				}
-
-				cacheMu.Lock()
-				lastOkPNG = time.Now()
-				cacheMu.Unlock()
-			}()
 		}
 	}()
+}
+
+func markRenderRunningIfDue(displayID int) bool {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+	cache := displayCaches[displayID]
+	if cache == nil {
+		return false
+	}
+	if cache.RenderRunning {
+		return false
+	}
+	if !cache.NextRenderAt.IsZero() && time.Now().Before(cache.NextRenderAt) {
+		return false
+	}
+	cache.RenderRunning = true
+	return true
+}
+
+func markRenderDone(displayID int) {
+	cacheMu.Lock()
+	if cache := displayCaches[displayID]; cache != nil {
+		cache.RenderRunning = false
+	}
+	cacheMu.Unlock()
+}
+
+func renderOneDisplay(rendererURL string, overrideSec int, displayID int) {
+	cacheMu.RLock()
+	hasCache := displayCaches[displayID] != nil && len(displayCaches[displayID].Raw) > 0
+	cacheMu.RUnlock()
+	if !hasCache {
+		_ = refreshCacheForDisplay(displayID)
+	}
+
+	st, _, err := buildStateFromCachedConfig(displayID)
+	if err != nil {
+		addFailLog(displayID, "render_state_build", err)
+		setNextRender(displayID, overrideSec, st.RefreshSec)
+		return
+	}
+
+	intervalSec := nextIntervalSec(overrideSec, st.RefreshSec)
+	setNextRender(displayID, intervalSec, 0)
+
+	w, h := getCachedDisplaySizeFallback(displayID)
+
+	rawForHash, err := json.Marshal(st)
+	if err == nil {
+		hv := sha256Hex(rawForHash)
+		if isSameStateHash(displayID, hv) {
+			return
+		}
+		setStateHash(displayID, hv)
+	}
+
+	png, err := callRendererPNG(rendererURL, w, h, st)
+	if err != nil {
+		addFailLog(displayID, "renderer_call", err)
+		return
+	}
+	screenPath := screenPathForDisplay(displayID)
+	if err := atomicWriteFile(screenPath, png); err != nil {
+		addFailLog(displayID, "screen_write", err)
+		return
+	}
+
+	cacheMu.Lock()
+	if cache := displayCaches[displayID]; cache != nil {
+		cache.LastOkPNGAt = time.Now()
+	}
+	cacheMu.Unlock()
+}
+
+func setNextRender(displayID int, intervalSec int, refreshSec int) {
+	interval := nextIntervalSec(intervalSec, refreshSec)
+	cacheMu.Lock()
+	if cache := displayCaches[displayID]; cache != nil {
+		cache.NextRenderAt = time.Now().Add(time.Duration(interval) * time.Second)
+	}
+	cacheMu.Unlock()
+}
+
+func nextIntervalSec(overrideSec int, refreshSec int) int {
+	intervalSec := 5
+	if overrideSec > 0 {
+		intervalSec = overrideSec
+	} else if refreshSec > 0 {
+		intervalSec = refreshSec
+	}
+	if intervalSec < 1 {
+		intervalSec = 1
+	}
+	return intervalSec
+}
+
+func isSameStateHash(displayID int, hash string) bool {
+	cacheMu.RLock()
+	defer cacheMu.RUnlock()
+	cache := displayCaches[displayID]
+	if cache == nil {
+		return false
+	}
+	return cache.LastStateHash == hash
+}
+
+func setStateHash(displayID int, hash string) {
+	cacheMu.Lock()
+	if cache := displayCaches[displayID]; cache != nil {
+		cache.LastStateHash = hash
+	}
+	cacheMu.Unlock()
 }
 
 /* =====================
@@ -482,21 +566,17 @@ func getTagoServiceKey() string {
 	return strings.TrimSpace(os.Getenv("TAGO_ARVL_SERVICE_KEY"))
 }
 
-func getTagoCityNode() (int, string, error) {
+func getTagoCityCode() (int, error) {
 	cityStr := strings.TrimSpace(os.Getenv("TAGO_CITY_CODE"))
-	nodeID := strings.TrimSpace(os.Getenv("TAGO_NODE_ID"))
 
 	if cityStr == "" {
-		return 0, "", fmt.Errorf("TAGO_CITY_CODE is empty")
+		return 0, fmt.Errorf("TAGO_CITY_CODE is empty")
 	}
 	cityCode, err := strconv.Atoi(cityStr)
 	if err != nil || cityCode <= 0 {
-		return 0, "", fmt.Errorf("TAGO_CITY_CODE invalid: %q", cityStr)
+		return 0, fmt.Errorf("TAGO_CITY_CODE invalid: %q", cityStr)
 	}
-	if nodeID == "" {
-		return 0, "", fmt.Errorf("TAGO_NODE_ID is empty")
-	}
-	return cityCode, nodeID, nil
+	return cityCode, nil
 }
 
 func allowDummyETA() bool {
@@ -646,10 +726,10 @@ func getDummyETA(routeID int) ETASnapshot {
 // 어떤 경우에도 state 스키마는 깨지면 안 된다.
 func buildStateFromCachedConfig(displayID int) (StateResponse, []byte, error) {
 	cacheMu.RLock()
-	rawCfg := append([]byte(nil), lastGoodRaw...)
+	cache := displayCaches[displayID]
 	cacheMu.RUnlock()
 
-	if len(rawCfg) == 0 {
+	if cache == nil || len(cache.Raw) == 0 {
 		st := StateResponse{
 			Theme:      "default",
 			RefreshSec: 30,
@@ -659,35 +739,18 @@ func buildStateFromCachedConfig(displayID int) (StateResponse, []byte, error) {
 		return st, mustMarshalState(st), fmt.Errorf("cache not ready")
 	}
 
-	var cfg DisplayConfig
-	if err := json.Unmarshal(rawCfg, &cfg); err != nil {
-		st := StateResponse{
-			Theme:      "default",
-			RefreshSec: 30,
-			Notice:     "invalid cached config",
-			Routes:     []StateRoute{},
-		}
-		return st, mustMarshalState(st), err
-	}
-
-	// display_id 확인(하드 실패로 막지 말고 notice로만 남김)
-	mismatch := (displayID > 0 && cfg.Display.DisplayID != displayID)
-
 	// TAGO 캐시 사용 (요청마다 fetch 금지)
-	arrMap, _, tagoErr, _ := getTagoCacheCopy()
+	arrMap, _, tagoErr, _ := getTagoCacheCopy(displayID)
 
 	noticeParts := make([]string, 0, 2)
-	if mismatch {
-		noticeParts = append(noticeParts, "display_id mismatch")
-	}
 	if tagoErr != "" {
 		noticeParts = append(noticeParts, "실시간 조회 실패")
 	}
 	notice := sanitizeNotice(strings.Join(noticeParts, " | "))
 
-	out := make([]StateRoute, 0, len(cfg.Routes))
+	out := make([]StateRoute, 0, len(cache.Config.Routes))
 
-	for _, r := range cfg.Routes {
+	for _, r := range cache.Config.Routes {
 		if !r.Enabled {
 			continue
 		}
@@ -720,11 +783,11 @@ func buildStateFromCachedConfig(displayID int) (StateResponse, []byte, error) {
 		})
 	}
 
-	out = limitRoutes(out, cfg.Settings.MaxRoutes)
+	out = limitRoutes(out, cache.Config.Settings.MaxRoutes)
 
 	state := StateResponse{
-		Theme:      cfg.Settings.Theme,
-		RefreshSec: cfg.Settings.RefreshSec,
+		Theme:      cache.Config.Settings.Theme,
+		RefreshSec: cache.Config.Settings.RefreshSec,
 		Notice:     notice,
 		Routes:     out,
 	}
@@ -741,7 +804,9 @@ func buildStateFromCachedConfig(displayID int) (StateResponse, []byte, error) {
 	}
 
 	cacheMu.Lock()
-	lastOkState = time.Now()
+	if cache := displayCaches[displayID]; cache != nil {
+		cache.LastOkStateAt = time.Now()
+	}
 	cacheMu.Unlock()
 
 	return state, rawState, nil
@@ -764,6 +829,8 @@ func buildDummyConfig() (DisplayConfig, []byte, error) {
 			Name:      "Test Display",
 			Width:     320,
 			Height:    160,
+			NodeID:    "DUMMY",
+			Enabled:   true,
 		},
 		Settings: Setting{
 			ID:         1,
@@ -800,6 +867,8 @@ type directusDisplayItem struct {
 	Name      string `json:"name"`
 	Width     int    `json:"width"`
 	Height    int    `json:"height"`
+	NodeID    string `json:"node_id"`
+	Enabled   bool   `json:"enabled"`
 }
 
 type directusSettingItem struct {
@@ -930,6 +999,8 @@ func fetchConfigFromDirectus(displayID int) (DisplayConfig, []byte, error) {
 			Name:      disp.Name,
 			Width:     disp.Width,
 			Height:    disp.Height,
+			NodeID:    disp.NodeID,
+			Enabled:   disp.Enabled,
 		},
 		Settings: Setting{
 			ID:         set.ID,
@@ -967,26 +1038,85 @@ func fetchConfigFromDirectus(displayID int) (DisplayConfig, []byte, error) {
 	return cfg, raw, nil
 }
 
+func fetchEnabledDisplays() ([]directusDisplayItem, error) {
+	if isDummyMode() {
+		return []directusDisplayItem{{
+			ID:        1,
+			DisplayID: 1,
+			Name:      "Test Display",
+			Width:     320,
+			Height:    160,
+			NodeID:    "DUMMY",
+			Enabled:   true,
+		}}, nil
+	}
+
+	base := getDirectusBaseURL()
+	if base == "" {
+		return nil, fmt.Errorf("DIRECTUS_URL is empty")
+	}
+
+	var resp directusListResp[directusDisplayItem]
+	url := fmt.Sprintf("%s/items/displays?filter[enabled][_eq]=true&limit=200", base)
+	if err := fetchJSON(url, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
 /* =====================
    Cache Refresh (Directus)
 ===================== */
 
-func refreshCacheOnce() error {
-	cfg, raw, err := fetchConfigFromDirectus(1)
+func refreshCacheForDisplay(displayID int) error {
+	cfg, raw, err := fetchConfigFromDirectus(displayID)
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+
+	cache := displayCaches[displayID]
+	if cache == nil {
+		cache = &displayCache{}
+		displayCaches[displayID] = cache
+	}
+
 	if err != nil {
-		addFailLog("directus_fetch", err)
+		cache.LastErr = err.Error()
+		cache.LastErrShort = summarizeError(err.Error())
+		addFailLog(displayID, "directus_fetch", err)
 		return err
 	}
 
-	_ = cfg // (현재는 raw만 캐시)
+	cache.Raw = raw
+	cache.Config = cfg
+	cache.LastGoodAt = time.Now()
+	cache.LastErr = ""
+	cache.LastErrShort = ""
+	return nil
+}
+
+func refreshCacheAll() error {
+	displays, err := fetchEnabledDisplays()
+	if err != nil {
+		addFailLog(0, "directus_display_list", err)
+		return err
+	}
+
+	displayIDs := make(map[int]struct{}, len(displays))
+	for _, d := range displays {
+		displayIDs[d.DisplayID] = struct{}{}
+		_ = refreshCacheForDisplay(d.DisplayID)
+	}
 
 	cacheMu.Lock()
-	lastGoodRaw = raw
-	lastGoodAt = time.Now()
-	lastErr = ""
-	lastErrShort = ""
+	for id := range displayCaches {
+		if _, ok := displayIDs[id]; !ok {
+			delete(displayCaches, id)
+			tagoMu.Lock()
+			delete(tagoCaches, id)
+			tagoMu.Unlock()
+		}
+	}
 	cacheMu.Unlock()
-
 	return nil
 }
 
@@ -1000,13 +1130,26 @@ func startTagoRefresher() {
 		defer ticker.Stop()
 
 		for range ticker.C {
-			cityCode, nodeID, err := getTagoCityNode()
+			cityCode, err := getTagoCityCode()
 			if err != nil {
-				setTagoCache(nil, err)
+				displayIDs := getCachedDisplayIDs()
+				for _, displayID := range displayIDs {
+					setTagoCache(displayID, nil, err)
+				}
 				continue
 			}
-			m, err := fetchArrivalsTAGO(cityCode, nodeID)
-			setTagoCache(m, err)
+
+			displayIDs := getCachedDisplayIDs()
+			for _, displayID := range displayIDs {
+				cacheMu.RLock()
+				cache := displayCaches[displayID]
+				cacheMu.RUnlock()
+				if cache == nil || strings.TrimSpace(cache.Config.Display.NodeID) == "" {
+					continue
+				}
+				m, err := fetchArrivalsTAGO(cityCode, cache.Config.Display.NodeID)
+				setTagoCache(displayID, m, err)
+			}
 		}
 	}()
 }
@@ -1023,10 +1166,6 @@ func main() {
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		cacheMu.RLock()
-		ok := len(lastGoodRaw) > 0
-		at := lastGoodAt
-		le := lastErr
-
 		n := 5
 		if len(failLogs) < n {
 			n = len(failLogs)
@@ -1035,110 +1174,91 @@ func main() {
 		if n > 0 {
 			copy(recent, failLogs[len(failLogs)-n:])
 		}
-		cacheMu.RUnlock()
-
-		_, tagoAt, tagoErr, tagoKeys := getTagoCacheCopy()
-		cacheMu.RLock()
-		lastOkStateAt := lastOkState
-		lastOkPngAt := lastOkPNG
-		lastErrShortLocal := lastErrShort
+		displayStatus := make(map[int]map[string]any, len(displayCaches))
+		for id, cache := range displayCaches {
+			tagoAt, tagoErr, tagoKeys := getTagoMeta(id)
+			displayStatus[id] = map[string]any{
+				"cache_ready":        len(cache.Raw) > 0,
+				"cache_at":           cache.LastGoodAt.Format(time.RFC3339),
+				"last_error":         cache.LastErr,
+				"last_error_summary": cache.LastErrShort,
+				"last_ok_state_at":   cache.LastOkStateAt.Format(time.RFC3339),
+				"last_ok_png_at":     cache.LastOkPNGAt.Format(time.RFC3339),
+				"tago_cache_at":      tagoAt.Format(time.RFC3339),
+				"tago_last_error":    tagoErr,
+				"tago_last_keys":     tagoKeys,
+				"node_id":            cache.Config.Display.NodeID,
+			}
+		}
 		cacheMu.RUnlock()
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status":           "ok",
-			"cache_ready":      ok,
-			"cache_at":         at.Format(time.RFC3339),
-			"last_error":       le,
-			"last_error_short": lastErrShortLocal,
-			"recent_fails":     recent,
-			"tago_cache_at":    tagoAt.Format(time.RFC3339),
-			"tago_last_error":  tagoErr,
-			"tago_last_keys":   tagoKeys,
-			"last_ok_state_at": lastOkStateAt.Format(time.RFC3339),
-			"last_ok_png_at":   lastOkPngAt.Format(time.RFC3339),
+			"status":       "ok",
+			"recent_fails": recent,
+			"displays":     displayStatus,
 		})
 	})
 
+	mux.HandleFunc("/v1/display/", func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/v1/display/")
+		parts := strings.Split(strings.Trim(path, "/"), "/")
+		if len(parts) != 2 {
+			http.NotFound(w, r)
+			return
+		}
+		displayID, err := strconv.Atoi(parts[0])
+		if err != nil || displayID <= 0 {
+			http.Error(w, "invalid display id", http.StatusBadRequest)
+			return
+		}
+		switch parts[1] {
+		case "config":
+			serveDisplayConfig(w, r, displayID)
+		case "state":
+			serveDisplayState(w, r, displayID)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
 	mux.HandleFunc("/v1/display/1/config", func(w http.ResponseWriter, r *http.Request) {
-		cacheMu.RLock()
-		cached := append([]byte(nil), lastGoodRaw...)
-		cacheMu.RUnlock()
-
-		if len(cached) > 0 {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(cached)
-			return
-		}
-
-		if err := refreshCacheOnce(); err != nil {
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
-			return
-		}
-
-		cacheMu.RLock()
-		cached = append([]byte(nil), lastGoodRaw...)
-		cacheMu.RUnlock()
-
-		if len(cached) == 0 {
-			http.Error(w, "cache not ready", http.StatusServiceUnavailable)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(cached)
+		serveDisplayConfig(w, r, 1)
 	})
 
 	mux.HandleFunc("/v1/display/1/state", func(w http.ResponseWriter, r *http.Request) {
-		cacheMu.RLock()
-		hasCache := len(lastGoodRaw) > 0
-		cacheMu.RUnlock()
-
-		if !hasCache {
-			_ = refreshCacheOnce()
-		}
-
-		_, rawState, err := buildStateFromCachedConfig(1)
-		if err != nil {
-			addFailLog("state_build", err)
-		}
-
-		// BIT 기준: 단말은 503 처리 못할 수 있어 200 + notice로 통일
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(rawState)
+		serveDisplayState(w, r, 1)
 	})
 
 	// screen.png 서빙 (BIT 단말은 이것만 GET)
-	mux.HandleFunc("/display/screen.png", func(w http.ResponseWriter, r *http.Request) {
-		screenPath := getenvDefault("SCREEN_PATH", "/data/screen.png")
-		b, err := os.ReadFile(screenPath)
-		if err != nil {
-			http.Error(w, "screen not ready", http.StatusNotFound)
+	mux.HandleFunc("/display/", func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/display/")
+		if path == "screen.png" {
+			serveScreenPNG(w, r, 1)
 			return
 		}
-		w.Header().Set("Content-Type", "image/png")
-		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-		w.Header().Set("Pragma", "no-cache")
-		w.Header().Set("Expires", "0")
-		sum := sha256.Sum256(b)
-		w.Header().Set("ETag", fmt.Sprintf("\"%x\"", sum[:]))
-		w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(b)
+		parts := strings.Split(strings.Trim(path, "/"), "/")
+		if len(parts) != 2 || parts[1] != "screen.png" {
+			http.NotFound(w, r)
+			return
+		}
+		displayID, err := strconv.Atoi(parts[0])
+		if err != nil || displayID <= 0 {
+			http.Error(w, "invalid display id", http.StatusBadRequest)
+			return
+		}
+		serveScreenPNG(w, r, displayID)
 	})
 
-	// 시작할 때 1번 즉시 갱신(Directus 캐시)
-	_ = refreshCacheOnce()
+	// 시작할 때 display 목록 즉시 갱신
+	_ = refreshCacheAll()
 
 	// 30초마다 Directus 갱신
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			_ = refreshCacheOnce()
+			_ = refreshCacheAll()
 		}
 	}()
 
@@ -1150,4 +1270,105 @@ func main() {
 
 	log.Println("go-api listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", mux))
+}
+
+func serveDisplayConfig(w http.ResponseWriter, r *http.Request, displayID int) {
+	cacheMu.RLock()
+	cache := displayCaches[displayID]
+	cacheMu.RUnlock()
+
+	if cache != nil && len(cache.Raw) > 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(cache.Raw)
+		return
+	}
+
+	if err := refreshCacheForDisplay(displayID); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+
+	cacheMu.RLock()
+	cache = displayCaches[displayID]
+	cacheMu.RUnlock()
+
+	if cache == nil || len(cache.Raw) == 0 {
+		http.Error(w, "cache not ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(cache.Raw)
+}
+
+func serveDisplayState(w http.ResponseWriter, r *http.Request, displayID int) {
+	cacheMu.RLock()
+	hasCache := displayCaches[displayID] != nil && len(displayCaches[displayID].Raw) > 0
+	cacheMu.RUnlock()
+
+	if !hasCache {
+		_ = refreshCacheForDisplay(displayID)
+	}
+
+	_, rawState, err := buildStateFromCachedConfig(displayID)
+	if err != nil {
+		addFailLog(displayID, "state_build", err)
+	}
+
+	// BIT 기준: 단말은 503 처리 못할 수 있어 200 + notice로 통일
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(rawState)
+}
+
+func serveScreenPNG(w http.ResponseWriter, r *http.Request, displayID int) {
+	screenPath := screenPathForDisplay(displayID)
+	b, err := os.ReadFile(screenPath)
+	if err != nil {
+		http.Error(w, "screen not ready", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+	sum := sha256.Sum256(b)
+	w.Header().Set("ETag", fmt.Sprintf("\"%x\"", sum[:]))
+	w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(b)
+}
+
+func getCachedDisplayIDs() []int {
+	cacheMu.RLock()
+	defer cacheMu.RUnlock()
+	ids := make([]int, 0, len(displayCaches))
+	for id := range displayCaches {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	return ids
+}
+
+func isDisplayEnabled(displayID int) bool {
+	cacheMu.RLock()
+	defer cacheMu.RUnlock()
+	cache := displayCaches[displayID]
+	if cache == nil {
+		return false
+	}
+	return cache.Config.Display.Enabled
+}
+
+func getTagoMeta(displayID int) (time.Time, string, []string) {
+	tagoMu.RLock()
+	defer tagoMu.RUnlock()
+	cache := tagoCaches[displayID]
+	if cache == nil {
+		return time.Time{}, "", nil
+	}
+	keys := append([]string(nil), cache.LastKeys...)
+	return cache.LastAt, cache.LastErr, keys
 }
