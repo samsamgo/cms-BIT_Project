@@ -1164,41 +1164,7 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		cacheMu.RLock()
-		n := 5
-		if len(failLogs) < n {
-			n = len(failLogs)
-		}
-		recent := make([]FailLog, n)
-		if n > 0 {
-			copy(recent, failLogs[len(failLogs)-n:])
-		}
-		displayStatus := make(map[int]map[string]any, len(displayCaches))
-		for id, cache := range displayCaches {
-			tagoAt, tagoErr, tagoKeys := getTagoMeta(id)
-			displayStatus[id] = map[string]any{
-				"cache_ready":        len(cache.Raw) > 0,
-				"cache_at":           cache.LastGoodAt.Format(time.RFC3339),
-				"last_error":         cache.LastErr,
-				"last_error_summary": cache.LastErrShort,
-				"last_ok_state_at":   cache.LastOkStateAt.Format(time.RFC3339),
-				"last_ok_png_at":     cache.LastOkPNGAt.Format(time.RFC3339),
-				"tago_cache_at":      tagoAt.Format(time.RFC3339),
-				"tago_last_error":    tagoErr,
-				"tago_last_keys":     tagoKeys,
-				"node_id":            cache.Config.Display.NodeID,
-			}
-		}
-		cacheMu.RUnlock()
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status":       "ok",
-			"recent_fails": recent,
-			"displays":     displayStatus,
-		})
-	})
+	mux.HandleFunc("/health", healthHandler)
 
 	mux.HandleFunc("/v1/display/", func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/v1/display/")
@@ -1270,6 +1236,70 @@ func main() {
 
 	log.Println("go-api listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", mux))
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	cacheMu.RLock()
+	n := 5
+	if len(failLogs) < n {
+		n = len(failLogs)
+	}
+	recent := make([]FailLog, n)
+	if n > 0 {
+		copy(recent, failLogs[len(failLogs)-n:])
+	}
+
+	displayStatus := make(map[int]map[string]any, len(displayCaches))
+	var primaryID int
+	var primaryCache *displayCache
+	if cache, ok := displayCaches[1]; ok {
+		primaryID = 1
+		primaryCache = cache
+	} else if len(displayCaches) > 0 {
+		ids := make([]int, 0, len(displayCaches))
+		for id := range displayCaches {
+			ids = append(ids, id)
+		}
+		sort.Ints(ids)
+		primaryID = ids[0]
+		primaryCache = displayCaches[primaryID]
+	}
+
+	for id, cache := range displayCaches {
+		tagoAt, tagoErr, tagoKeys := getTagoMeta(id)
+		displayStatus[id] = map[string]any{
+			"cache_ready":        len(cache.Raw) > 0,
+			"cache_at":           cache.LastGoodAt.Format(time.RFC3339),
+			"last_error":         cache.LastErr,
+			"last_error_summary": cache.LastErrShort,
+			"last_ok_state_at":   cache.LastOkStateAt.Format(time.RFC3339),
+			"last_ok_png_at":     cache.LastOkPNGAt.Format(time.RFC3339),
+			"tago_cache_at":      tagoAt.Format(time.RFC3339),
+			"tago_last_error":    tagoErr,
+			"tago_last_keys":     tagoKeys,
+			"node_id":            cache.Config.Display.NodeID,
+		}
+	}
+	cacheMu.RUnlock()
+
+	var topLastOkStateAt, topLastOkPNGAt string
+	if primaryCache != nil {
+		topLastOkStateAt = primaryCache.LastOkStateAt.Format(time.RFC3339)
+		topLastOkPNGAt = primaryCache.LastOkPNGAt.Format(time.RFC3339)
+	} else {
+		topLastOkStateAt = time.Time{}.Format(time.RFC3339)
+		topLastOkPNGAt = time.Time{}.Format(time.RFC3339)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":           "ok",
+		"recent_fails":     recent,
+		"displays":         displayStatus,
+		"primary_display":  primaryID,
+		"last_ok_state_at": topLastOkStateAt,
+		"last_ok_png_at":   topLastOkPNGAt,
+	})
 }
 
 func serveDisplayConfig(w http.ResponseWriter, r *http.Request, displayID int) {
