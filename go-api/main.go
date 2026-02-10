@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -162,6 +163,18 @@ func addFailLog(displayID int, where string, err error) {
 		failLogs = failLogs[len(failLogs)-failLogsMax:]
 	}
 	cacheMu.Unlock()
+
+	// fixed-key log format for operations
+	log.Printf("fail where=%s display_id=%d reason=%s", where, displayID, summarizeError(err.Error()))
+}
+
+func runWithIsolation(displayID int, where string, fn func()) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			addFailLog(displayID, where, fmt.Errorf("panic: %v", rec))
+		}
+	}()
+	fn()
 }
 
 /* =====================
@@ -249,6 +262,12 @@ func getenvIntDefault(k string, def int) int {
 }
 
 func atomicWriteFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0644); err != nil {
 		return err
@@ -297,7 +316,7 @@ func sha256Hex(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func callRendererPNG(rendererURL string, width, height int, st StateResponse) ([]byte, error) {
+func callRendererPNG(rendererURL string, timeout time.Duration, width, height int, st StateResponse) ([]byte, error) {
 	payload := map[string]any{
 		"width":  width,
 		"height": height,
@@ -314,7 +333,7 @@ func callRendererPNG(rendererURL string, width, height int, st StateResponse) ([
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("renderer request failed: %w", err)
@@ -358,8 +377,14 @@ func screenPathForDisplay(displayID int) string {
 			return legacy
 		}
 	}
-	pattern := getenvDefault("SCREEN_PATH_PATTERN", "/data/screen_%d.png")
-	return fmt.Sprintf(pattern, displayID)
+	pattern := getenvDefault("SCREEN_PATH_PATTERN", "/data/screen_{id}.png")
+	if strings.Contains(pattern, "{id}") {
+		return strings.ReplaceAll(pattern, "{id}", strconv.Itoa(displayID))
+	}
+	if strings.Contains(pattern, "%d") {
+		return fmt.Sprintf(pattern, displayID)
+	}
+	return pattern
 }
 
 func startRenderRefresher() {
@@ -369,9 +394,12 @@ func startRenderRefresher() {
 
 	// env로 주기 강제 가능
 	overrideSec := getenvIntDefault("RENDER_INTERVAL_SEC", 0)
+	timeout := rendererTimeout()
 	concurrency := getenvIntDefault("RENDER_CONCURRENCY", 1)
 	if concurrency < 1 {
 		concurrency = 1
+	} else if concurrency > 2 {
+		concurrency = 2
 	}
 	sem := make(chan struct{}, concurrency)
 
@@ -380,23 +408,27 @@ func startRenderRefresher() {
 		defer ticker.Stop()
 
 		for range ticker.C {
-			displayIDs := getCachedDisplayIDs()
-			for _, displayID := range displayIDs {
-				if !isDisplayEnabled(displayID) {
-					continue
+			runWithIsolation(0, "render_tick_panic", func() {
+				displayIDs := getCachedDisplayIDs()
+				for _, displayID := range displayIDs {
+					if !isDisplayEnabled(displayID) {
+						continue
+					}
+					if !markRenderRunningIfDue(displayID) {
+						continue
+					}
+					go func(id int) {
+						sem <- struct{}{}
+						defer func() {
+							<-sem
+							markRenderDone(id)
+						}()
+						runWithIsolation(id, "render_worker_panic", func() {
+							renderOneDisplay(rendererURL, timeout, overrideSec, id)
+						})
+					}(displayID)
 				}
-				if !markRenderRunningIfDue(displayID) {
-					continue
-				}
-				go func(id int) {
-					sem <- struct{}{}
-					defer func() {
-						<-sem
-						markRenderDone(id)
-					}()
-					renderOneDisplay(rendererURL, overrideSec, id)
-				}(displayID)
-			}
+			})
 		}
 	}()
 }
@@ -426,7 +458,7 @@ func markRenderDone(displayID int) {
 	cacheMu.Unlock()
 }
 
-func renderOneDisplay(rendererURL string, overrideSec int, displayID int) {
+func renderOneDisplay(rendererURL string, timeout time.Duration, overrideSec int, displayID int) {
 	cacheMu.RLock()
 	hasCache := displayCaches[displayID] != nil && len(displayCaches[displayID].Raw) > 0
 	cacheMu.RUnlock()
@@ -455,7 +487,7 @@ func renderOneDisplay(rendererURL string, overrideSec int, displayID int) {
 		setStateHash(displayID, hv)
 	}
 
-	png, err := callRendererPNG(rendererURL, w, h, st)
+	png, err := callRendererPNG(rendererURL, timeout, w, h, st)
 	if err != nil {
 		addFailLog(displayID, "renderer_call", err)
 		return
@@ -493,6 +525,36 @@ func nextIntervalSec(overrideSec int, refreshSec int) int {
 		intervalSec = 1
 	}
 	return intervalSec
+}
+
+func rendererTimeout() time.Duration {
+	sec := getenvIntDefault("RENDER_TIMEOUT_SEC", 15)
+	if sec < 10 {
+		sec = 10
+	}
+	if sec > 30 {
+		sec = 30
+	}
+	return time.Duration(sec) * time.Second
+}
+
+func pngStaleThreshold() time.Duration {
+	sec := getenvIntDefault("PNG_STALE_SEC", 180)
+	if sec < 60 {
+		sec = 60
+	}
+	return time.Duration(sec) * time.Second
+}
+
+func getPNGStaleInfo(lastOK time.Time, now time.Time, threshold time.Duration) (bool, int64) {
+	if lastOK.IsZero() {
+		return true, -1
+	}
+	if now.Before(lastOK) {
+		return false, 0
+	}
+	age := now.Sub(lastOK)
+	return age > threshold, int64(age.Seconds())
 }
 
 func isSameStateHash(displayID int, hash string) bool {
@@ -602,11 +664,16 @@ func loadDotEnvBestEffort() {
    TAGO fetch
 ===================== */
 
-func fetchArrivalsTAGO(cityCode int, nodeId string) (map[string]ETASnapshot, error) {
+func fetchArrivalsTAGO(nodeID string) (map[string]ETASnapshot, error) {
 	key := getTagoServiceKey()
 	if key == "" {
 		// ✅ 에러 문구 명확화
 		return nil, fmt.Errorf("TAGO_ARVL_SERVICE_KEY is empty")
+	}
+
+	cityCode, err := getTagoCityCode()
+	if err != nil {
+		return nil, err
 	}
 
 	base := "https://apis.data.go.kr/1613000/ArvlInfoInqireService/getSttnAcctoArvlPrearngeInfoList"
@@ -618,7 +685,7 @@ func fetchArrivalsTAGO(cityCode int, nodeId string) (map[string]ETASnapshot, err
 	q.Set("serviceKey", key)
 	q.Set("_type", "json")
 	q.Set("cityCode", strconv.Itoa(cityCode))
-	q.Set("nodeId", nodeId)
+	q.Set("nodeId", nodeID)
 	q.Set("numOfRows", "30")
 	q.Set("pageNo", "1")
 	u.RawQuery = q.Encode()
@@ -1071,7 +1138,6 @@ func fetchEnabledDisplays() ([]directusDisplayItem, error) {
 func refreshCacheForDisplay(displayID int) error {
 	cfg, raw, err := fetchConfigFromDirectus(displayID)
 	cacheMu.Lock()
-	defer cacheMu.Unlock()
 
 	cache := displayCaches[displayID]
 	if cache == nil {
@@ -1082,6 +1148,7 @@ func refreshCacheForDisplay(displayID int) error {
 	if err != nil {
 		cache.LastErr = err.Error()
 		cache.LastErrShort = summarizeError(err.Error())
+		cacheMu.Unlock()
 		addFailLog(displayID, "directus_fetch", err)
 		return err
 	}
@@ -1091,6 +1158,7 @@ func refreshCacheForDisplay(displayID int) error {
 	cache.LastGoodAt = time.Now()
 	cache.LastErr = ""
 	cache.LastErrShort = ""
+	cacheMu.Unlock()
 	return nil
 }
 
@@ -1130,26 +1198,21 @@ func startTagoRefresher() {
 		defer ticker.Stop()
 
 		for range ticker.C {
-			cityCode, err := getTagoCityCode()
-			if err != nil {
+			runWithIsolation(0, "tago_tick_panic", func() {
 				displayIDs := getCachedDisplayIDs()
 				for _, displayID := range displayIDs {
-					setTagoCache(displayID, nil, err)
+					runWithIsolation(displayID, "tago_display_panic", func() {
+						cacheMu.RLock()
+						cache := displayCaches[displayID]
+						cacheMu.RUnlock()
+						if cache == nil || strings.TrimSpace(cache.Config.Display.NodeID) == "" {
+							return
+						}
+						m, err := fetchArrivalsTAGO(cache.Config.Display.NodeID)
+						setTagoCache(displayID, m, err)
+					})
 				}
-				continue
-			}
-
-			displayIDs := getCachedDisplayIDs()
-			for _, displayID := range displayIDs {
-				cacheMu.RLock()
-				cache := displayCaches[displayID]
-				cacheMu.RUnlock()
-				if cache == nil || strings.TrimSpace(cache.Config.Display.NodeID) == "" {
-					continue
-				}
-				m, err := fetchArrivalsTAGO(cityCode, cache.Config.Display.NodeID)
-				setTagoCache(displayID, m, err)
-			}
+			})
 		}
 	}()
 }
@@ -1240,6 +1303,8 @@ func main() {
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	cacheMu.RLock()
+	now := time.Now()
+	staleThreshold := pngStaleThreshold()
 	n := 5
 	if len(failLogs) < n {
 		n = len(failLogs)
@@ -1267,6 +1332,14 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 
 	for id, cache := range displayCaches {
 		tagoAt, tagoErr, tagoKeys := getTagoMeta(id)
+		pngStale, pngAgeSec := getPNGStaleInfo(cache.LastOkPNGAt, now, staleThreshold)
+		displayStatusValue := "OK"
+		if pngStale {
+			displayStatusValue = "STALE"
+		}
+		if cache.LastErrShort != "" {
+			displayStatusValue = "ERROR"
+		}
 		displayStatus[id] = map[string]any{
 			"cache_ready":        len(cache.Raw) > 0,
 			"cache_at":           cache.LastGoodAt.Format(time.RFC3339),
@@ -1274,10 +1347,15 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 			"last_error_summary": cache.LastErrShort,
 			"last_ok_state_at":   cache.LastOkStateAt.Format(time.RFC3339),
 			"last_ok_png_at":     cache.LastOkPNGAt.Format(time.RFC3339),
+			"png_age_sec":        pngAgeSec,
+			"png_stale":          pngStale,
+			"status":             displayStatusValue,
 			"tago_cache_at":      tagoAt.Format(time.RFC3339),
 			"tago_last_error":    tagoErr,
 			"tago_last_keys":     tagoKeys,
 			"node_id":            cache.Config.Display.NodeID,
+			"state_hash":         cache.LastStateHash,
+			"render_running":     cache.RenderRunning,
 		}
 	}
 	cacheMu.RUnlock()
