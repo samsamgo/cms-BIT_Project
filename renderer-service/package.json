@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "renderer-service",
   "version": "1.0.0",
   "private": true,
@@ -8,7 +8,10 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "playwright": "^1.48.0"
+    "express": "^5.2.1",
+    "playwright": "^1.63.0"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }

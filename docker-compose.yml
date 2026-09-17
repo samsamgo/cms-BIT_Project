@@ -8,11 +8,9 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-directus_password}
     volumes:
       - pg_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
 
   directus:
-    image: directus/directus:10.12.1
+    image: directus/directus:11.17.4
     restart: unless-stopped
     depends_on:
       - postgres
@@ -46,8 +44,6 @@ services:
     environment:
       PORT: "3000"
       TEMPLATE_PATH: "/app/template.html"
-    ports:
-      - "3000:3000"
 
   go-api:
     build:
