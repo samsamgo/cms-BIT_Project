@@ -160,6 +160,15 @@
         border-color: rgba(122, 138, 160, 0.45);
       }
 
+      /* 노선 3개 이상: 한 줄 행으로 줄여 160px 안에 모두 들어가게 */
+      #canvas.compact li {
+        padding: 3px 6px;
+      }
+
+      #canvas.compact .route-sub {
+        display: none;
+      }
+
       .empty {
         position: relative;
         z-index: 1;
@@ -224,6 +233,9 @@
       const emptyEl = document.getElementById("empty");
 
       const routes = Array.isArray(state.routes) ? state.routes : [];
+      if (routes.length > 2) {
+        canvas.classList.add("compact");
+      }
       if (routes.length === 0) {
         emptyEl.hidden = false;
       } else {
