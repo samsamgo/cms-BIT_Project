@@ -93,45 +93,117 @@
         list-style: none;
         margin: 0;
         padding: 0;
+        flex: 1;
+        min-height: 0;
         display: flex;
         flex-direction: column;
-        gap: 4px;
+        gap: 3px;
       }
 
+      /* 한 줄 = 노선번호 | 정거장 점 + 버스 아이콘 | 도착 분 (2026-09-17) */
       li {
+        flex: 1;
+        min-height: 0;
         display: grid;
-        grid-template-columns: 1fr auto;
+        grid-template-columns: 44px 1fr 50px;
         align-items: center;
-        gap: 8px;
-        padding: 5px 6px;
+        gap: 6px;
+        padding: 0 6px;
         background: var(--panel);
         border: 1px solid var(--panel-border);
         border-radius: 6px;
-        box-shadow: none;
-        opacity: 1;
-        transform: none;
       }
 
       .route {
         font-weight: 700;
-        letter-spacing: 0.3px;
+        letter-spacing: 0.2px;
         font-size: 13px;
+        white-space: nowrap;
+        overflow: hidden;
       }
 
-      .route-sub {
-        font-size: 10px;
+      .track {
+        position: relative;
+        height: 100%;
+        min-height: 20px;
+      }
+
+      .rail {
+        position: absolute;
+        left: 4px;
+        right: 6px;
+        top: 62%;
+        height: 2px;
+        margin-top: -1px;
+        background: rgba(148, 163, 184, 0.28);
+        border-radius: 1px;
+      }
+
+      .rail-done {
+        position: absolute;
+        right: 6px;
+        top: 62%;
+        height: 2px;
+        margin-top: -1px;
+        background: var(--accent);
+        border-radius: 1px;
+      }
+
+      .dot {
+        position: absolute;
+        top: 62%;
+        width: 4px;
+        height: 4px;
+        margin: -2px 0 0 -2px;
+        border-radius: 50%;
+        background: #3a4a5e;
+      }
+
+      .dot.ahead {
+        background: var(--accent);
+      }
+
+      .stop {
+        position: absolute;
+        top: 62%;
+        width: 9px;
+        height: 9px;
+        margin: -4.5px 0 0 -4.5px;
+        border-radius: 50%;
+        background: var(--bg-0);
+        border: 2px solid var(--fg);
+      }
+
+      .bus {
+        position: absolute;
+        top: 62%;
+        width: 16px;
+        height: 12px;
+        margin: -13px 0 0 -8px;
+      }
+
+      .stops-label {
+        position: absolute;
+        right: 2px;
+        top: 0;
+        font-size: 8px;
+        line-height: 10px;
         color: var(--muted);
-        margin-top: 1px;
+        white-space: nowrap;
+      }
+
+      .track.none .rail {
+        background: repeating-linear-gradient(90deg, rgba(148, 163, 184, 0.25) 0 4px, transparent 4px 7px);
       }
 
       .eta {
-        padding: 3px 7px;
+        padding: 2px 4px;
         border-radius: 999px;
         font-size: 11px;
         font-weight: 700;
         background: rgba(255, 255, 255, 0.08);
         border: 1px solid rgba(255, 255, 255, 0.15);
-        min-width: 50px;
+        white-space: nowrap;
         text-align: center;
       }
 
@@ -160,14 +232,9 @@
         border-color: rgba(122, 138, 160, 0.45);
       }
 
-      /* 노선 3개 이상: 한 줄 행으로 줄여 160px 안에 모두 들어가게 */
-      #canvas.compact li {
-        padding: 3px 6px;
-      }
-
-      #canvas.compact .route-sub {
-        display: none;
-      }
+      #canvas.dense .route { font-size: 11px; }
+      #canvas.dense .stops-label { display: none; }
+      #canvas.dense .rail, #canvas.dense .rail-done, #canvas.dense .dot, #canvas.dense .stop, #canvas.dense .bus { top: 55%; }
 
       .empty {
         position: relative;
@@ -233,39 +300,57 @@
       const emptyEl = document.getElementById("empty");
 
       const routes = Array.isArray(state.routes) ? state.routes : [];
-      if (routes.length > 2) {
-        canvas.classList.add("compact");
-      }
+      // 버스 아이콘 (이모지 글꼴이 없는 서버에서도 그려지게 SVG)
+      const BUS_SVG =
+        '<svg class="bus" viewBox="0 0 16 12" xmlns="http://www.w3.org/2000/svg">' +
+        '<rect x="0.5" y="0.5" width="15" height="9" rx="2" fill="#31d18f"/>' +
+        '<rect x="2" y="2" width="4" height="3" rx="0.6" fill="#0b1118"/>' +
+        '<rect x="7" y="2" width="4" height="3" rx="0.6" fill="#0b1118"/>' +
+        '<rect x="12" y="2" width="2.5" height="5" rx="0.6" fill="#0b1118"/>' +
+        '<circle cx="4" cy="10" r="1.6" fill="#f8fafc"/><circle cx="12" cy="10" r="1.6" fill="#f8fafc"/></svg>';
+      const SLOTS = 8; // 우리 정류장 앞 8정거장까지 점으로 보인다. 더 멀면 버스는 왼쪽 끝에서 기다린다
+
       if (routes.length === 0) {
         emptyEl.hidden = false;
       } else {
-        routes.forEach((route, idx) => {
+        if (routes.length >= 4) canvas.classList.add("dense");
+        routes.forEach((route) => {
           const li = document.createElement("li");
-
-          const left = document.createElement("div");
 
           const routeName = document.createElement("span");
           routeName.className = "route";
           routeName.textContent = route.route ?? "-";
 
-          const routeSub = document.createElement("div");
-          routeSub.className = "route-sub";
-          routeSub.textContent = "도착 예정";
+          const status = (route.status || "NO_DATA").toLowerCase();
+          const stops = Number.isInteger(route.stops_left) ? route.stops_left : null;
+          const track = document.createElement("div");
+          track.className = "track" + (status === "ok" && stops !== null ? "" : " none");
+          const L = 4, R = 6; // .rail 의 left/right 와 같게
+          const xAt = (i) => `calc(${L}px + (100% - ${L + R}px) * ${i / SLOTS})`; // i = 0(가장 먼 점) … SLOTS(우리 정류장)
+          let html = '<div class="rail"></div>';
+          if (status === "ok" && stops !== null) {
+            const pos = Math.max(0, SLOTS - Math.min(stops, SLOTS)); // 버스 위치
+            html += `<div class="rail-done" style="left:${xAt(pos)}"></div>`;
+            for (let i = 0; i < SLOTS; i++) html += `<div class="dot${i >= pos ? " ahead" : ""}" style="left:${xAt(i)}"></div>`;
+            html += `<div class="stop" style="left:${xAt(SLOTS)}"></div>`;
+            html += BUS_SVG.replace('class="bus"', `class="bus" style="left:${xAt(pos)}"`);
+            const label = stops <= 0 ? "곧 도착" : `${stops}정거장 전`;
+            html += `<span class="stops-label">${label}</span>`;
+          } else {
+            for (let i = 0; i < SLOTS; i++) html += `<div class="dot" style="left:${xAt(i)}"></div>`;
+            html += `<div class="stop" style="left:${xAt(SLOTS)}"></div>`;
+          }
+          track.innerHTML = html;
 
           const eta = document.createElement("span");
-          const status = (route.status || "NO_DATA").toLowerCase();
-          const fallbackText =
-            status === "ended" ? "운행 종료" : status === "no_data" ? "정보 없음" : "정보 없음";
+          const fallbackText = status === "ended" ? "운행 종료" : "정보 없음";
           const etaText = route.display_eta ?? fallbackText;
-          const soon = typeof etaText === "string" && etaText.replace(/\s/g, "").includes("곧");
-          eta.className = `eta ${
-            soon ? "soon" : status === "ok" ? "ok" : status === "ended" ? "ended" : "no-data"
-          }`;
-          eta.textContent = etaText;
+          const soon = status === "ok" && (etaText.replace(/\s/g, "").includes("곧") || etaText.includes("도착중") || stops === 0);
+          eta.className = `eta ${soon ? "soon" : status === "ok" ? "ok" : status === "ended" ? "ended" : "no-data"}`;
+          eta.textContent = status === "ok" ? etaText : status === "ended" ? "종료" : "없음";
 
-          left.appendChild(routeName);
-          left.appendChild(routeSub);
-          li.appendChild(left);
+          li.appendChild(routeName);
+          li.appendChild(track);
           li.appendChild(eta);
           routesEl.appendChild(li);
         });

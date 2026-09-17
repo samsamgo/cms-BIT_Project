@@ -78,7 +78,8 @@ type FailLog struct {
 type StateRoute struct {
 	Route      string `json:"route"`
 	DisplayETA string `json:"display_eta"`
-	Status     string `json:"status"` // "OK" | "NO_DATA" | "ENDED"
+	Status     string `json:"status"`               // "OK" | "NO_DATA" | "ENDED"
+	StopsLeft  *int   `json:"stops_left,omitempty"` // 가장 먼저 오는 버스가 남긴 정거장 수 (TAGO arrprevstationcnt)
 }
 
 type StateResponse struct {
@@ -91,6 +92,7 @@ type StateResponse struct {
 type ETASnapshot struct {
 	ETASec *int
 	Ended  bool
+	Stops  *int // 남은 정거장 수 (알 때만)
 }
 
 // TAGO 응답 item이 "객체" 또는 "배열"로 올 수 있어 RawMessage로 분기
@@ -749,7 +751,12 @@ func fetchArrivalsTAGO(nodeID string) (map[string]ETASnapshot, error) {
 				continue
 			}
 		}
-		out[k] = ETASnapshot{ETASec: &tmp, Ended: false}
+		snap := ETASnapshot{ETASec: &tmp, Ended: false}
+		if it.ArrPrevStationCnt >= 0 {
+			stops := it.ArrPrevStationCnt
+			snap.Stops = &stops
+		}
+		out[k] = snap
 	}
 	return out, nil
 }
@@ -786,7 +793,8 @@ func getDummyETA(routeID int) ETASnapshot {
 		return ETASnapshot{ETASec: nil, Ended: false}
 	}
 	sec := 20 + (routeID%9)*30
-	return ETASnapshot{ETASec: &sec, Ended: false}
+	stops := sec / 90
+	return ETASnapshot{ETASec: &sec, Ended: false, Stops: &stops}
 }
 
 // cached config(lastGoodRaw)를 입력으로 state를 만든다.
@@ -843,11 +851,15 @@ func buildStateFromCachedConfig(displayID int) (StateResponse, []byte, error) {
 
 		displayETA, status := formatETA(eta.ETASec, eta.Ended)
 
-		out = append(out, StateRoute{
+		sr := StateRoute{
 			Route:      clampText(r.RouteName, 12),
 			DisplayETA: displayETA,
 			Status:     status,
-		})
+		}
+		if status == "OK" {
+			sr.StopsLeft = eta.Stops
+		}
+		out = append(out, sr)
 	}
 
 	out = limitRoutes(out, cache.Config.Settings.MaxRoutes)
